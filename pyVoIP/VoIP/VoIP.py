@@ -529,12 +529,73 @@ class VoIPPhone:
             elif request.method == "BYE":
                 self._callback_MSG_Bye(request)
         else:
-            if request.status == SIP.SIPStatus.OK:
+            # Only treat responses for INVITE as call-control.
+            cseq = request.headers.get("CSeq", {})
+            cseq_method = cseq.get("method") if isinstance(cseq, dict) else None
+            if cseq_method != "INVITE":
+                return
+
+            code = int(request.status)
+            if 100 <= code < 200:
+                self._callback_RESP_Provisional(request)
+            elif request.status == SIP.SIPStatus.OK:
                 self._callback_RESP_OK(request)
             elif request.status == SIP.SIPStatus.NOT_FOUND:
                 self._callback_RESP_NotFound(request)
             elif request.status == SIP.SIPStatus.SERVICE_UNAVAILABLE:
                 self._callback_RESP_Unavailable(request)
+            else:
+                self._callback_RESP_Failed(request)
+
+    def _callback_RESP_Provisional(self, request: SIP.SIPMessage) -> None:
+        call_id = request.headers.get("Call-ID")
+        if call_id in self.calls:
+            call = self.calls[call_id]
+            if request.status in (SIP.SIPStatus.RINGING, SIP.SIPStatus.SESSION_PROGRESS):
+                if call.state == CallState.DIALING:
+                    call.state = CallState.RINGING
+
+        require = request.headers.get("Require", "")
+        if isinstance(require, str) and "100rel" in require.lower():
+            warnings.warn(
+                "Received reliable provisional response (Require: 100rel). "
+                "pyVoIP does not implement PRACK; calls may stall at 18x/183.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def _callback_RESP_Failed(self, request: SIP.SIPMessage) -> None:
+        call_id = request.headers.get("Call-ID", "UNKNOWN")
+        code = int(request.status)
+        phrase = getattr(request.status, "phrase", "")
+
+        # ACK final INVITE responses to stop retransmits.
+        try:
+            ack = self.sip.gen_ack(request)
+            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        except Exception as ex:
+            debug(
+                f"Failed to send ACK: {ex}\n{request.summary()}",
+                f"Failed to send ACK for Call-ID={call_id}: {ex}",
+            )
+
+        # End the call locally.
+        if call_id in self.calls:
+            call = self.calls[call_id]
+            for rtp in call.RTPClients:
+                try:
+                    rtp.stop()
+                except Exception:
+                    pass
+            call.state = CallState.ENDED
+            self.release_ports(call=call)
+            del self.calls[call_id]
+
+        warnings.warn(
+            f"Call failed with SIP {code} {phrase} (Call-ID={call_id}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     def getStatus(self) -> PhoneStatus:
         warnings.warn(
@@ -605,6 +666,9 @@ class VoIPPhone:
         call_id = request.headers["Call-ID"]
         if call_id not in self.calls:
             debug("Unknown/No call")
+            # Still ACK 200 OK to stop retransmits.
+            ack = self.sip.gen_ack(request)
+            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
             return
         # TODO: Somehow never is reached. Find out if you have a network
         # issue here or your invite is wrong.
@@ -622,6 +686,10 @@ class VoIPPhone:
                 "TODO: Add 481 here as server is probably waiting for "
                 + "an ACK"
             )
+            ack = self.sip.gen_ack(request)
+            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+            return
+
         self.calls[call_id].not_found(request)
         debug("Terminating Call")
         ack = self.sip.gen_ack(request)
@@ -636,6 +704,9 @@ class VoIPPhone:
                 "TODO: Add 481 here as server is probably waiting for "
                 + "an ACK"
             )
+            ack = self.sip.gen_ack(request)
+            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+            return
         self.calls[call_id].unavailable(request)
         debug("Terminating Call")
         ack = self.sip.gen_ack(request)

@@ -347,6 +347,9 @@ class SIPMessage:
         self.headers: Dict[str, Any] = {"Via": []}
         self.body: Dict[str, Any] = {}
         self.authentication: Dict[str, str] = {}
+        # Which header populated `self.authentication` (WWW-Authenticate,
+        # Proxy-Authenticate, Authorization, Proxy-Authorization).
+        self.authentication_header: Optional[str] = None
         self.raw = data
         self.auth_match = re.compile(r'(\w+)=("[^",]+"|[^ \t,]+)')
         self.parse(data)
@@ -471,14 +474,24 @@ class SIPMessage:
             self.headers[header] = data.split(", ")
         elif header == "Content-Length":
             self.headers[header] = int(data)
-        elif header == "WWW-Authenticate" or header == "Authorization":
-            data = data.replace("Digest ", "")
+        elif header in (
+            "WWW-Authenticate",
+            "Authorization",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+        ):
+            # Common formats:
+            #   Digest realm="...", nonce="..."
+            # Some stacks omit the space after "Digest".
+            if data.startswith("Digest"):
+                data = data[len("Digest") :].lstrip()
             row_data = self.auth_match.findall(data)
             header_data = {}
             for var, data in row_data:
                 header_data[var] = data.strip('"')
             self.headers[header] = header_data
             self.authentication = header_data
+            self.authentication_header = header
         else:
             self.headers[header] = data
 
@@ -881,6 +894,12 @@ class SIPClient:
         self.default_expires = 120
         self.register_timeout = 30
 
+        # How long invite() should wait for the *first* response that matches
+        # its Call-ID before giving up.
+        self.invite_timeout = 30
+        # Max times to retry INVITE after 401/407.
+        self.invite_max_retries = 1
+
         self.inviteCounter = Counter()
         self.registerCounter = Counter()
         self.subscribeCounter = Counter()
@@ -973,10 +992,18 @@ class SIPClient:
                 except Exception as ex:
                     debug(f"Failed sending 505 response: {ex}")
             else:
-                debug(f"SIPParseError in SIP.recv: {type(e)}, {e}")
+                start_line = raw.split(b"\r\n", 1)[0]
+                debug(
+                    f"SIPParseError in SIP.recv: {type(e)}, {e}",
+                    f"SIPParseError: {e} (start_line={start_line!r})",
+                )
             return
         except Exception as ex:
-            debug(f"Error on header parsing: {ex}")
+            start_line = raw.split(b"\r\n", 1)[0]
+            debug(
+                f"Error on header parsing: {ex}",
+                f"Error parsing SIP message: {ex} (start_line={start_line!r})",
+            )
             return
 
         debug(message.summary())
@@ -992,26 +1019,22 @@ class SIPClient:
         return self.parse_message(message)
 
     def parse_message(self, message: SIPMessage) -> None:
+        # Responses (SIP/2.0 ...)
         if message.type != SIPMessageType.MESSAGE:
-            if message.status == SIPStatus.OK:
-                if self.callCallback is not None:
+            if self.callCallback is not None:
+                try:
                     self.callCallback(message)
-            elif message.status == SIPStatus.NOT_FOUND:
-                if self.callCallback is not None:
-                    self.callCallback(message)
-            elif message.status == SIPStatus.SERVICE_UNAVAILABLE:
-                if self.callCallback is not None:
-                    self.callCallback(message)
-            elif (
-                message.status == SIPStatus.TRYING
-                or message.status == SIPStatus.RINGING
-            ):
-                pass
+                except Exception as ex:
+                    debug(
+                        f"Exception in callCallback: {ex}\n{message.summary()}",
+                        f"Exception in callCallback: {ex} "
+                        f"(start_line={str(message.heading,'utf8',errors='replace')})",
+                    )
             else:
                 debug(
-                    "TODO: Add 500 Error on Receiving SIP Response:\r\n"
-                    + message.summary(),
-                    "TODO: Add 500 Error on Receiving SIP Response",
+                    message.summary(),
+                    "Received SIP response but no callCallback is set: "
+                    + str(message.heading, "utf8", errors="replace"),
                 )
             self.s.setblocking(True)
             return
@@ -1726,54 +1749,144 @@ class SIPClient:
         with self.recvLock:
             self.out.sendto(invite.encode("utf8"), (self.server, self.port))
             debug("Invited")
-            response = SIPMessage(self.s.recv(8192))
+            deadline = time.monotonic() + self.invite_timeout
+            retries = 0
+            last_response: Optional[SIPMessage] = None
 
-            while (
-                response.status != SIPStatus(401)
-                and response.status != SIPStatus(100)
-                and response.status != SIPStatus(180)
-            ) or response.headers["Call-ID"] != call_id:
-                if not self.NSD:
-                    break
-                self.parse_message(response)
+            while self.NSD and time.monotonic() < deadline:
+                timeout = min(1.0, max(0.0, deadline - time.monotonic()))
+                ready = select.select([self.s], [], [], timeout)
+                if not ready[0]:
+                    continue
+
                 response = SIPMessage(self.s.recv(8192))
+                last_response = response
 
-            if response.status == SIPStatus(
-                100
-            ) or response.status == SIPStatus(180):
+                if response.headers.get("Call-ID") != call_id:
+                    # Not our transaction, process normally.
+                    self.parse_message(response)
+                    continue
+
+                status_code = int(response.status)
+
+                # Any 1xx response is "call progressing". Return control.
+                if 100 <= status_code < 200:
+                    return SIPMessage(invite.encode("utf8")), call_id, sess_id
+
+                # Digest challenges (401 / 407)
+                if response.status in (
+                    SIPStatus.UNAUTHORIZED,
+                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+                ) and retries < self.invite_max_retries:
+                    ack = self.gen_ack(response)
+                    self.out.sendto(ack.encode("utf8"), (self.server, self.port))
+
+                    header_name = "Authorization"
+                    if (
+                        response.status == SIPStatus.PROXY_AUTHENTICATION_REQUIRED
+                        or response.authentication_header == "Proxy-Authenticate"
+                    ):
+                        header_name = "Proxy-Authorization"
+
+                    digest_uri = f"sip:{number}@{self.server}"
+                    auth_line = self._build_digest_auth_header(
+                        response,
+                        header_name=header_name,
+                        method="INVITE",
+                        uri=digest_uri,
+                    )
+
+                    branch = self._bump_branch(branch)
+                    invite = self.gen_invite(
+                        number, str(sess_id), ms, sendtype, branch, call_id
+                    )
+                    invite = invite.replace(
+                        "\r\nContent-Length",
+                        f"\r\n{auth_line}Content-Length",
+                    )
+                    self.out.sendto(invite.encode("utf8"), (self.server, self.port))
+                    retries += 1
+
+                    # Return now; receive loop handles subsequent messages.
+                    return SIPMessage(invite.encode("utf8")), call_id, sess_id
+
+                # Final response (>=200) — don't hang waiting for only 100/180.
+                debug(
+                    response.summary(),
+                    f"INVITE got final response {status_code} {response.status.phrase} "
+                    f"(Call-ID={call_id})",
+                )
                 return SIPMessage(invite.encode("utf8")), call_id, sess_id
-            debug(f"Received Response: {response.summary()}")
-            ack = self.gen_ack(response)
-            self.out.sendto(ack.encode("utf8"), (self.server, self.port))
-            debug("Acknowledged")
-            authhash = self.gen_authorization(response)
-            nonce = response.authentication["nonce"]
-            realm = response.authentication["realm"]
-            auth = (
-                f'Authorization: Digest username="{self.username}",realm='
-                + f'"{realm}",nonce="{nonce}",uri="sip:{self.server};'
-                + f'transport=UDP",response="{str(authhash, "utf8")}",'
-                + "algorithm=MD5\r\n"
+
+            extra = ""
+            if last_response is not None:
+                extra = " Last response: " + str(
+                    last_response.heading, "utf8", errors="replace"
+                )
+            raise TimeoutError(
+                f"INVITE timed out after {self.invite_timeout}s (Call-ID={call_id}).{extra}"
             )
 
-            hexindex = (
-                -5
-            )  # increment the hex digit at this position to get a slightly different branch id
-            hexdigit = (int(branch[hexindex], 16) + 1) & 15
-            branch = (
-                branch[0:hexindex] + f"{hexdigit:x}" + branch[hexindex + 1 :]
-            )
+    @staticmethod
+    def _bump_branch(branch: str) -> str:
+        hexindex = -5
+        try:
+            hexdigit = (int(branch[hexindex], 16) + 1) & 0xF
+            return branch[:hexindex] + f"{hexdigit:x}" + branch[hexindex + 1 :]
+        except Exception:
+            return branch + "1"
 
-            invite = self.gen_invite(
-                number, str(sess_id), ms, sendtype, branch, call_id
-            )
-            invite = invite.replace(
-                "\r\nContent-Length", f"\r\n{auth}Content-Length"
-            )
+    def _build_digest_auth_header(
+        self,
+        challenge: SIPMessage,
+        *,
+        header_name: str,
+        method: str,
+        uri: str,
+    ) -> str:
+        auth = challenge.authentication or {}
+        realm = auth.get("realm")
+        nonce = auth.get("nonce")
+        if not realm or not nonce:
+            raise SIPParseError(f"Digest challenge missing realm/nonce: {auth}")
 
-            self.out.sendto(invite.encode("utf8"), (self.server, self.port))
+        algorithm = auth.get("algorithm", "MD5")
+        opaque = auth.get("opaque")
+        qop_raw = auth.get("qop")
 
-            return SIPMessage(invite.encode("utf8")), call_id, sess_id
+        def md5_hex(s: str) -> str:
+            return hashlib.md5(s.encode("utf8")).hexdigest()
+
+        ha1 = md5_hex(f"{self.username}:{realm}:{self.password}")
+        ha2 = md5_hex(f"{method}:{uri}")
+
+        qop_token: Optional[str] = None
+        if qop_raw:
+            tokens = [t.strip() for t in qop_raw.split(",") if t.strip()]
+            lowered = [t.lower() for t in tokens]
+            qop_token = "auth" if "auth" in lowered else tokens[0]
+
+        if qop_token:
+            nc = "00000001"
+            cnonce = uuid.uuid4().hex
+            response = md5_hex(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop_token}:{ha2}")
+        else:
+            nc = None
+            cnonce = None
+            response = md5_hex(f"{ha1}:{nonce}:{ha2}")
+
+        header = (
+            f'{header_name}: Digest username="{self.username}",'
+            f'realm="{realm}",nonce="{nonce}",uri="{uri}",response="{response}"'
+        )
+        if opaque:
+            header += f',opaque="{opaque}"'
+        if algorithm:
+            header += f",algorithm={algorithm}"
+        if qop_token and nc and cnonce:
+            header += f',qop={qop_token},nc={nc},cnonce="{cnonce}"'
+        header += "\r\n"
+        return header
 
     def bye(self, request: SIPMessage) -> None:
         message = self.gen_bye(request)

@@ -13,8 +13,8 @@
 
 - RTP: Fix RTP sequence/timestamp overflow resulting in corruption
 - RTP: Better payload bytes handling
-- SIP: Header parsing was too strict and could cause crashes
-- SIP: Body parsing was too strict and could cause crashes
+- SIP: Fix: Header parsing was too strict and could cause crashes
+- SIP: Fix: Body parsing was too strict and could cause crashes
 - SIP: More robust rtpmap / a=fmtp parsing
 - SIP: Fix: SIPParseError was never raised in SIPClient.recv()
 - setup.py - Update package name and bump version
