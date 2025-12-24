@@ -170,6 +170,7 @@ class VoIPCall:
                 # TODO: If no codecs are compatible then send error to PBX.
 
                 port = self.phone.request_port()
+                self.assignedPorts[port] = codecs  # or assoc, anything truthy
                 self.create_rtp_clients(
                     codecs, self.myIP, port, request, i["port"]
                 )

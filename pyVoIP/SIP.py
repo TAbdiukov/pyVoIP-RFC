@@ -372,7 +372,7 @@ class SIPMessage:
 
     def parse(self, data: bytes) -> None:
         try:
-            headers, body = data.split(b"\r\n\r\n")
+            headers, body = data.split(b"\r\n\r\n", 1)
         except ValueError as ve:
             debug(f"Error unpacking data, only using header: {ve}")
             headers = data.split(b"\r\n\r\n")[0]
@@ -621,7 +621,7 @@ class SIPMessage:
                     d = data.split(":")
                     self.body[header] = {"method": d[0], "key": d[1]}
                 else:
-                    self.body[header] = {"method": d}
+                    self.body[header] = {"method": data}
             elif header == "m":
                 # SDP 5.14 Media Descriptions
                 # m=<media> <port>/<number of ports> <proto> <fmt> ...
@@ -760,7 +760,7 @@ class SIPMessage:
         return self.parse_sip_response(data)
 
     def parse_sip_response(self, data: bytes) -> None:
-        headers, body = data.split(b"\r\n\r\n")
+        headers, body = data.split(b"\r\n\r\n", 1)
 
         headers_raw = headers.split(b"\r\n")
         self.heading = headers_raw.pop(0)
@@ -784,7 +784,9 @@ class SIPMessage:
         return self.parse_sip_message(data)
 
     def parse_sip_message(self, data: bytes) -> None:
-        headers, body = data.split(b"\r\n\r\n")
+        self.uri = str(self.heading.split(b" ")[1], "utf8")
+
+        headers, body = data.split(b"\r\n\r\n", 1)
 
         headers_raw = headers.split(b"\r\n")
         self.heading = headers_raw.pop(0)
@@ -1556,14 +1558,16 @@ class SIPClient:
 
     def gen_ack(self, request: SIPMessage) -> str:
         tag = self.tagLibrary[request.headers["Call-ID"]]
-        t = request.headers["To"]["raw"].strip("<").strip(">")
+        t = request.headers["To"]["raw"].lstrip("<").rstrip(">")
         ackMessage = f"ACK {t} SIP/2.0\r\n"
         ackMessage += self._gen_response_via_header(request)
         ackMessage += "Max-Forwards: 70\r\n"
-        ackMessage += (
-            f"To: {request.headers['To']['raw']};tag="
-            + f"{self.gen_tag()}\r\n"
-        )
+
+        to_line = request.headers["To"]["raw"]
+        if request.headers["To"]["tag"]:
+            to_line += f";tag={request.headers['To']['tag']}"
+        ackMessage += f"To: {to_line}\r\n"
+
         ackMessage += f"From: {request.headers['From']['raw']};tag={tag}\r\n"
         ackMessage += f"Call-ID: {request.headers['Call-ID']}\r\n"
         ackMessage += f"CSeq: {request.headers['CSeq']['check']} ACK\r\n"

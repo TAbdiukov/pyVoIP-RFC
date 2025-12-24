@@ -28,18 +28,12 @@ debug = pyVoIP.debug
 
 
 def byte_to_bits(byte: bytes) -> str:
-    nbyte = bin(ord(byte)).lstrip("-0b")
-    nbyte = ("0" * (8 - len(nbyte))) + nbyte
-    return nbyte
-
+    if len(byte) != 1:
+        raise ValueError(f"byte_to_bits expects 1 byte, got {len(byte)}")
+    return format(byte[0], "08b")
 
 def add_bytes(byte_string: bytes) -> int:
-    binary = ""
-    for byte in byte_string:
-        nbyte = bin(byte).lstrip("-0b")
-        nbyte = ("0" * (8 - len(nbyte))) + nbyte
-        binary += nbyte
-    return int(binary, 2)
+    return int.from_bytes(byte_string, "big", signed=False)
 
 
 class DynamicPayloadType(Exception):
