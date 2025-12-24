@@ -6,8 +6,8 @@ with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 setup(
-    name="pyVoIP RFC",
-    version="1.7.0",
+    name="pyVoIP",
+    version="1.7.0RFC",
     description="PyVoIP is a pure python VoIP/SIP/RTP library.",
     install_requires=['audioop-lts>=0.2.1; python_version>="3.13"'],
     long_description=long_description,
