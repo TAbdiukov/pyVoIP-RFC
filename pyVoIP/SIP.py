@@ -673,15 +673,23 @@ class SIPMessage:
                     if attribute == "rtpmap":
                         # a=rtpmap:<payload type> <encoding name>/<clock rate> [/<encoding parameters>] # noqa: E501
                         v = re.split(" |/", value)
-                        for t in self.body["m"]:
-                            if v[0] in t["methods"]:
-                                index = int(self.body["m"].index(t))
+
+                        index = None
+                        for idx, t in enumerate(self.body.get("m", [])):
+                            if v[0] in t.get("methods", []):
+                                index = idx
                                 break
+                        if index is None:
+                            # Can't attach to a media section; keep as session-level info.
+                            self.body["a"][f"rtpmap:{v[0]}"] = value
+                            return
+
                         if len(v) == 4:
                             encoding = v[3]
                         else:
                             encoding = None
 
+                        self.body["m"][index]["attributes"].setdefault(v[0], {})
                         self.body["m"][index]["attributes"][v[0]]["rtpmap"] = {
                             "id": v[0],
                             "name": v[1],
@@ -692,11 +700,15 @@ class SIPMessage:
                     elif attribute == "fmtp":
                         # a=fmtp:<format> <format specific parameters>
                         d = value.split(" ")
-                        for t in self.body["m"]:
-                            if d[0] in t["methods"]:
-                                index = int(self.body["m"].index(t))
+                        index = None
+                        for idx, t in enumerate(self.body.get("m", [])):
+                            if d[0] in t.get("methods", []):
+                                index = idx
                                 break
-
+                        if index is None:
+                            self.body["a"][f"fmtp:{d[0]}"] = " ".join(d[1:])
+                            return
+                        self.body["m"][index]["attributes"].setdefault(d[0], {})
                         self.body["m"][index]["attributes"][d[0]]["fmtp"] = {
                             "id": d[0],
                             "settings": d[1:],
@@ -724,16 +736,23 @@ class SIPMessage:
         headers_raw: List[bytes], handle: Callable[[str, str], None]
     ) -> None:
         headers: Dict[str, Any] = {"Via": []}
-        # Only use first occurance of VIA header field;
-        # got second VIA from Kamailio running in DOCKER
-        # According to RFC 3261 these messages should be
-        # discarded in a response
-        for x in headers_raw:
-            i = str(x, "utf8").split(": ")
-            if i[0] == "Via":
-                headers["Via"].append(i[1])
-            if i[0] not in headers.keys():
-                headers[i[0]] = i[1]
+        # SIP headers are typically "Name: value" but some stacks omit the space
+        # or use multiple spaces. Split on the first ":" and normalize.
+        for raw_line in headers_raw:
+            line = str(raw_line, "utf8", errors="replace")
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            name = name.strip()
+            value = value.lstrip()
+
+            if name == "Via":
+                headers["Via"].append(value)
+                continue
+
+            # Keep the first occurrence for most headers.
+            if name not in headers:
+                headers[name] = value
 
         for key, val in headers.items():
             handle(key, val)
@@ -744,10 +763,15 @@ class SIPMessage:
     ) -> None:
         if len(body) > 0:
             body_raw = body.split(b"\r\n")
-            for x in body_raw:
-                i = str(x, "utf8").split("=")
-                if i != [""]:
-                    handle(i[0], i[1])
+            for raw_line in body_raw:
+                if not raw_line:
+                    continue
+                line = str(raw_line, "utf8", errors="replace")
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key:
+                    handle(key, value)
 
     def parseSIPResponse(self, data: bytes) -> None:
         warnings.warn(
@@ -760,7 +784,10 @@ class SIPMessage:
         return self.parse_sip_response(data)
 
     def parse_sip_response(self, data: bytes) -> None:
-        headers, body = data.split(b"\r\n\r\n", 1)
+        try:
+            headers, body = data.split(b"\r\n\r\n", 1)
+        except ValueError:
+            headers, body = data, b""
 
         headers_raw = headers.split(b"\r\n")
         self.heading = headers_raw.pop(0)
@@ -784,13 +811,22 @@ class SIPMessage:
         return self.parse_sip_message(data)
 
     def parse_sip_message(self, data: bytes) -> None:
-        self.uri = str(self.heading.split(b" ")[1], "utf8")
-
-        headers, body = data.split(b"\r\n\r\n", 1)
+        try:
+            headers, body = data.split(b"\r\n\r\n", 1)
+        except ValueError:
+            headers, body = data, b""
 
         headers_raw = headers.split(b"\r\n")
         self.heading = headers_raw.pop(0)
-        self.version = str(self.heading.split(b" ")[2], "utf8")
+        parts = self.heading.split(b" ")
+        if len(parts) < 3:
+            raise SIPParseError(
+                "Unable to decipher SIP request: " + str(self.heading, "utf8")
+            )
+
+        self.uri = str(parts[1], "utf8", errors="replace")
+        self.version = str(parts[2], "utf8", errors="replace")
+
         if self.version not in self.SIPCompatibleVersions:
             raise SIPParseError(f"SIP Version {self.version} not compatible.")
 
@@ -847,6 +883,54 @@ class SIPClient:
         self.registerFailures = 0
         self.recvLock = Lock()
 
+    def _gen_sip_version_not_supported_raw(self, raw: bytes) -> str:
+        """
+        Build a 505 response without requiring SIPMessage parsing (which may
+        fail specifically because of the unsupported SIP version).
+        """
+        lines = [
+            str(l, "utf8", errors="replace")
+            for l in raw.split(b"\r\n")
+            if l
+        ]
+
+        def first_header(prefix: str) -> str:
+            p = prefix.lower()
+            for line in lines:
+                if line.lower().startswith(p):
+                    return line
+            return ""
+
+        via_lines = [l for l in lines if l.lower().startswith("via:")]
+        from_line = first_header("From:")
+        to_line = first_header("To:")
+        call_id_line = first_header("Call-ID:")
+        cseq_line = first_header("CSeq:")
+        contact_line = first_header("Contact:")
+
+        if to_line and ";tag=" not in to_line.lower():
+            to_line = f"{to_line};tag={self.gen_tag()}"
+
+        response = "SIP/2.0 505 SIP Version Not Supported\r\n"
+        for v in via_lines:
+            response += v + "\r\n"
+        if from_line:
+            response += from_line + "\r\n"
+        if to_line:
+            response += to_line + "\r\n"
+        if call_id_line:
+            response += call_id_line + "\r\n"
+        if cseq_line:
+            response += cseq_line + "\r\n"
+        if contact_line:
+            response += contact_line + "\r\n"
+        response += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
+        response += 'Warning: 399 GS "Unable to accept call"\r\n'
+        response += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
+        response += "Content-Length: 0\r\n\r\n"
+        return response
+
+
     def recv_loop(self) -> None:
         while self.NSD:
             try:
@@ -859,29 +943,33 @@ class SIPClient:
     def recv(self) -> None:
         try:
             raw = self.s.recv(8192)
-            if raw != b"\x00\x00\x00\x00":
-                try:
-                    message = SIPMessage(raw)
-                    debug(message.summary())
-                    self.parse_message(message)
-                except Exception as ex:
-                    debug(f"Error on header parsing: {ex}")
+        except BlockingIOError:
+            # Re-raise so recv_loop() can release locks and continue
+            raise
+
+        if raw == b"\x00\x00\x00\x00":
+            return
+
+        try:
+            message = SIPMessage(raw)
         except SIPParseError as e:
             if "SIP Version" in str(e):
-                request = self.gen_sip_version_not_supported(message)
-                self.out.sendto(
-                    request.encode("utf8"), (self.server, self.port)
-                )
+                try:
+                    resp = self._gen_sip_version_not_supported_raw(raw)
+                    self.out.sendto(
+                        resp.encode("utf8"), (self.server, self.port)
+                    )
+                except Exception as ex:
+                    debug(f"Failed sending 505 response: {ex}")
             else:
                 debug(f"SIPParseError in SIP.recv: {type(e)}, {e}")
-        except BlockingIOError:
-            # Re-raise BlockingIOError so recv_loop() can release locks and
-            # continue
-            raise
-        except Exception as e:
-            debug(f"SIP.recv error: {type(e)}, {e}\n\n{str(raw, 'utf8')}")
-            if pyVoIP.DEBUG:
-                raise
+            return
+        except Exception as ex:
+            debug(f"Error on header parsing: {ex}")
+            return
+
+        debug(message.summary())
+        self.parse_message(message)
 
     def parseMessage(self, message: SIPMessage) -> None:
         warnings.warn(

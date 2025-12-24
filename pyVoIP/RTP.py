@@ -299,6 +299,7 @@ class RTPClient:
         # Example: {0: PayloadType.PCMU, 101: PayloadType.EVENT}
         self.assoc = assoc
         debug("Selecting audio codec for transmission")
+        self.preference: Optional[PayloadType] = None
         for m in assoc:
             try:
                 if int(assoc[m]) is not None:
@@ -312,6 +313,11 @@ class RTPClient:
                     break
             except Exception:
                 debug(f"{assoc[m]} cannot be selected as an audio codec")
+        if self.preference is None:
+            raise RTPParseError(
+                "No transmittable audio codec negotiated (assoc contained only "
+                "dynamic/unsupported payloads)."
+            )
 
         self.inIP = inIP
         self.inPort = inPort
@@ -376,19 +382,25 @@ class RTPClient:
     def trans(self) -> None:
         while self.NSD:
             last_sent = time.monotonic_ns()
-            payload = self.pmout.read()
-            payload = self.encode_packet(payload)
-            packet = b"\x80"  # RFC 1889 V2 No Padding Extension or CC.
-            packet += chr(int(self.preference)).encode("utf8")
-            try:
-                packet += self.outSequence.to_bytes(2, byteorder="big")
-            except OverflowError:
-                self.outSequence = 0
-            try:
-                packet += self.outTimestamp.to_bytes(4, byteorder="big")
-            except OverflowError:
-                self.outTimestamp = 0
-            packet += self.outSSRC.to_bytes(4, byteorder="big")
+            raw_payload = self.pmout.read()
+            payload = self.encode_packet(raw_payload)
+
+            # RTP header:
+            # V=2, P=0, X=0, CC=0 => 0x80
+            packet = b"\x80"
+
+            # Marker=0, PT=7 bits
+            pt = int(self.preference) & 0x7F
+            packet += pt.to_bytes(1, byteorder="big", signed=False)
+
+            # Wrap sequence/timestamp instead of letting to_bytes overflow.
+            seq = self.outSequence & 0xFFFF
+            ts = self.outTimestamp & 0xFFFFFFFF
+            ssrc = self.outSSRC & 0xFFFFFFFF
+
+            packet += seq.to_bytes(2, byteorder="big", signed=False)
+            packet += ts.to_bytes(4, byteorder="big", signed=False)
+            packet += ssrc.to_bytes(4, byteorder="big", signed=False)
             packet += payload
 
             # debug(payload)
@@ -402,11 +414,12 @@ class RTPClient:
                     stacklevel=2,
                 )
 
-            self.outSequence += 1
-            self.outTimestamp += len(payload)
+            self.outSequence = (self.outSequence + 1) & 0xFFFF
+            self.outTimestamp = (self.outTimestamp + len(payload)) & 0xFFFFFFFF
             # Calculate how long it took to generate this packet.
             # Then how long we should wait to send the next, then devide by 2.
-            delay = (1 / self.preference.rate) * 160
+            rate = self.preference.rate if self.preference.rate > 0 else 8000
+            delay = (1 / rate) * 160
             sleep_time = max(
                 0, delay - ((time.monotonic_ns() - last_sent) / 1000000000)
             )
