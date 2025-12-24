@@ -1,6 +1,6 @@
 # Changelog
 
-## (upcoming)
+## 1.7.0+RFC
 
 - RTP: Fix integer overflow after ~22 min at 20ms for PCMU/PCMA
 - RTP: Fix and optimize byte formation (for bytes over 0x7F)
@@ -18,3 +18,8 @@
 - SIP: More robust rtpmap / a=fmtp parsing
 - SIP: Fix: SIPParseError was never raised in SIPClient.recv()
 - setup.py - Update package name and bump version
+
+- SIP: Fix crash on unknown request type
+- SIP: Implement and wire basic OPTIONS support
+- Misc: Update .gitignore
+- Misc: lint

@@ -379,18 +379,29 @@ class SIPMessage:
 
         headers_raw = headers.split(b"\r\n")
         heading = headers_raw.pop(0)
-        check = str(heading.split(b" ")[0], "utf8")
+        parts = heading.split(b" ")
+        if len(parts) < 1:
+            raise SIPParseError("Empty SIP start line")
 
-        if check in self.SIPCompatibleVersions:
+        first = str(parts[0], "utf8", errors="replace")
+
+        # Response: "SIP/2.0 200 OK"
+        if first in self.SIPCompatibleVersions:
             self.type = SIPMessageType.RESPONSE
             self.parse_sip_response(data)
-        elif check in self.SIPCompatibleMethods:
-            self.type = SIPMessageType.MESSAGE
-            self.parse_sip_message(data)
-        else:
-            raise SIPParseError(
-                "Unable to decipher SIP request: " + str(heading, "utf8")
-            )
+            return
+
+        # Request: "METHOD sip:... SIP/2.0"
+        if len(parts) >= 3:
+            last = str(parts[-1], "utf8", errors="replace")
+            if last in self.SIPCompatibleVersions:
+                self.type = SIPMessageType.MESSAGE
+                self.parse_sip_message(data)
+                return
+
+        raise SIPParseError(
+            "Unable to decipher SIP request: " + str(heading, "utf8", errors="replace")
+        )
 
     def parseHeader(self, header: str, data: str) -> None:
         warnings.warn(
@@ -1037,6 +1048,22 @@ class SIPClient:
             self.callCallback(message)  # type: ignore
             response = self.gen_ok(message)
             self.out.sendto(response.encode("utf8"), (self.server, self.port))
+        elif message.method == "OPTIONS":
+            # Common keep-alive / capability probe. Reply 200 OK.
+            response = self.gen_ok(message)
+            try:
+                # Prefer replying to the sender indicated by Via.
+                (_sender_address, _sender_port) = message.headers["Via"][0]["address"]
+                self.out.sendto(
+                    response.encode("utf8"),
+                    (_sender_address, int(_sender_port)),
+                )
+            except Exception:
+                # Fallback: reply to configured server.
+                self.out.sendto(
+                    response.encode("utf8"),
+                    (self.server, self.port),
+                )
         else:
             debug("TODO: Add 400 Error on non processable request")
 
