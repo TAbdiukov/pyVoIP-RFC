@@ -327,7 +327,9 @@ class VoIPCall:
         )
 
     def answered(self, request: SIP.SIPMessage) -> None:
-        if self.state != CallState.DIALING:
+        if self.state == CallState.ANSWERED:
+            return
+        if self.state not in (CallState.DIALING, CallState.RINGING):
             return
         debug(
             request.summary(),
@@ -571,6 +573,11 @@ class VoIPPhone:
             auth_username=self.auth_username,
         )
 
+    def _send_ack(self, request: SIP.SIPMessage) -> None:
+        ack = self.sip.gen_ack(request)
+        host, port = self.sip.ack_target(request)
+        self.sip.out.sendto(ack.encode("utf8"), (host, port))
+
     def callback(self, request: SIP.SIPMessage) -> None:
         # debug("Callback: "+request.summary())
         if request.type == pyVoIP.SIP.SIPMessageType.MESSAGE:
@@ -632,8 +639,7 @@ class VoIPPhone:
 
         # ACK final INVITE responses to stop retransmits.
         try:
-            ack = self.sip.gen_ack(request)
-            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+            self._send_ack(request)
         except Exception as ex:
             debug(
                 f"Failed to send ACK: {ex}\n{request.summary()}",
@@ -745,8 +751,7 @@ class VoIPPhone:
         if call_id not in self.calls:
             debug("Unknown/No call")
             # Still ACK 200 OK to stop retransmits.
-            ack = self.sip.gen_ack(request)
-            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+            self._send_ack(request)
             return
         # TODO: Somehow never is reached. Find out if you have a network
         # issue here or your invite is wrong.
@@ -769,8 +774,7 @@ class VoIPPhone:
                 "TODO: Add 481 here as server is probably waiting for "
                 + "an ACK"
             )
-            ack = self.sip.gen_ack(request)
-            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+            self._send_ack(request)
             return
 
         self.calls[call_id].not_found(request)
@@ -792,8 +796,7 @@ class VoIPPhone:
                 "TODO: Add 481 here as server is probably waiting for "
                 + "an ACK"
             )
-            ack = self.sip.gen_ack(request)
-            self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+            self._send_ack(request)
             return
         self.calls[call_id].unavailable(request)
         debug("Terminating Call")

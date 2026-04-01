@@ -919,6 +919,42 @@ class SIPClient:
         self.pending_invite_responses: Dict[str, SIPMessage] = {}
         self.last_invite_debug: Dict[str, Any] = {}
 
+    @staticmethod
+    def _extract_uri(value: str) -> str:
+        value = value.strip()
+        if "<" in value and ">" in value:
+            value = value.split("<", 1)[1].split(">", 1)[0]
+        return value.strip()
+
+    @staticmethod
+    def _sip_target_from_uri(uri: str, default_port: int = 5060) -> Tuple[str, int]:
+        target = uri.strip()
+        if target.lower().startswith("sip:"):
+            target = target[4:]
+        if "@" in target:
+            target = target.split("@", 1)[1]
+        target = target.split("?", 1)[0]
+        if ";" in target:
+            target = target.split(";", 1)[0]
+        if ":" in target:
+            host, port = target.rsplit(":", 1)
+            try:
+                return host, int(port)
+            except ValueError:
+                pass
+        return target, default_port
+
+    def ack_target(self, request: SIPMessage) -> Tuple[str, int]:
+        if (
+            request.type == SIPMessageType.RESPONSE
+            and 200 <= int(request.status) < 300
+            and request.headers.get("Contact")
+        ):
+            return self._sip_target_from_uri(
+                self._extract_uri(str(request.headers["Contact"]))
+            )
+        return self.server, self.port
+
     def _set_last_invite_debug(self, **kwargs) -> None:
         self.last_invite_debug.update(kwargs)
         self.last_invite_debug["updated_at"] = time.time()
@@ -1057,6 +1093,33 @@ class SIPClient:
                 + f"cseq={cseq_method} "
                 + f"status={int(message.status)} {message.status.phrase}",
             )
+
+            if cseq_method == "INVITE":
+                code = int(message.status)
+
+                if 100 <= code < 180:
+                    event = "invite-provisional"
+                    state = "dialing"
+                elif 180 <= code < 200:
+                    event = "invite-provisional"
+                    state = "ringing"
+                elif 200 <= code < 300:
+                    event = "invite-final"
+                    state = "connected"
+                else:
+                    event = "invite-final"
+                    state = "failed"
+
+                self._set_last_invite_debug(
+                    event=event,
+                    status=state,
+                    call_id=message.headers.get("Call-ID"),
+                    status_code=code,
+                    phrase=message.status.phrase,
+                    description=message.status.description,
+                    response_heading=str(message.heading, "utf8", errors="replace"),
+                    error=None,
+                )
 
             if self.callCallback is not None:
                 try:
@@ -1446,7 +1509,7 @@ class SIPClient:
             "Expires: "
             + f"{self.default_expires if not deregister else 0}\r\n"
         )
-        
+
         regRequest += auth_line
         regRequest += "Content-Length: 0"
         regRequest += "\r\n\r\n"
@@ -1503,10 +1566,12 @@ class SIPClient:
             f"From: {request.headers['From']['raw']};tag="
             + f"{request.headers['From']['tag']}\r\n"
         )
-        okResponse += (
-            f"To: {request.headers['To']['raw']};tag="
-            + f"{self.gen_tag()}\r\n"
-        )
+        to_line = request.headers["To"]["raw"]
+        if request.headers["To"]["tag"]:
+            to_line += f";tag={request.headers['To']['tag']}"
+        else:
+            to_line += f";tag={self.gen_tag()}"
+        okResponse += f"To: {to_line}\r\n"
         okResponse += f"Call-ID: {request.headers['Call-ID']}\r\n"
         okResponse += (
             f"CSeq: {request.headers['CSeq']['check']} "
@@ -1749,9 +1814,24 @@ class SIPClient:
 
     def gen_ack(self, request: SIPMessage) -> str:
         tag = self.tagLibrary[request.headers["Call-ID"]]
-        t = request.headers["To"]["raw"].lstrip("<").rstrip(">")
-        ackMessage = f"ACK {t} SIP/2.0\r\n"
-        ackMessage += self._gen_response_via_header(request)
+
+        is_2xx = (
+            request.type == SIPMessageType.RESPONSE
+            and 200 <= int(request.status) < 300
+        )
+
+        if is_2xx and request.headers.get("Contact"):
+            ack_uri = self._extract_uri(str(request.headers["Contact"]))
+            via = (
+                f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
+                + f"branch={self.gen_branch()};rport\r\n"
+            )
+        else:
+            ack_uri = request.headers["To"]["raw"].lstrip("<").rstrip(">")
+            via = self._gen_response_via_header(request)
+
+        ackMessage = f"ACK {ack_uri} SIP/2.0\r\n"
+        ackMessage += via
         ackMessage += "Max-Forwards: 70\r\n"
 
         to_line = request.headers["To"]["raw"]

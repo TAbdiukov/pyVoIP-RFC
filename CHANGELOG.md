@@ -1,7 +1,10 @@
 # Changelog
 
+
 ## 1.7.0+RFC
 
+- PyVOIP-RFC - Fix workflows
+- PyVOIP-RFC - Begin using telemetry for workflows
 - Debug: Add detailed outbound call telemetry (Call-ID, session ID, last SIP response, RTP ports, worker thread state)
 - Debug: Timestamp pyVoIP debug output and trace INVITE progress/auth/final responses in more detail
 - VoIP: Preserve fast final INVITE responses so they can still be inspected after the VoIPCall object is created
