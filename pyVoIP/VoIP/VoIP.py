@@ -209,6 +209,14 @@ class VoIPCall:
         request: SIP.SIPMessage,
         baseport: int,
     ) -> None:
+        debug(
+            f"Creating RTP client(s) for {self.call_id}",
+            "Call RTP setup "
+            + f"call_id={self.call_id} local={ip}:{port} "
+            + f"remote_base={baseport} codecs="
+            + ",".join(f"{pt}:{codec}" for pt, codec in codecs.items()),
+        )
+
         for ii in range(len(request.body["c"])):
             # TODO: Check IPv4/IPv6
             c = RTP.RTPClient(
@@ -300,6 +308,12 @@ class VoIPCall:
         if self.state != CallState.RINGING:
             raise InvalidStateError("Call is not ringing")
         m = self.gen_ms()
+        debug(
+            f"Answering call {self.call_id}",
+            "Call answer requested "
+            + f"call_id={self.call_id} local_rtp_ports={list(m.keys())}",
+        )
+
         message = self.sip.gen_answer(
             self.request, self.session_id, m, self.sendmode
         )
@@ -307,10 +321,19 @@ class VoIPCall:
             message.encode("utf8"), (self.phone.server, self.phone.port)
         )
         self.state = CallState.ANSWERED
+        debug(
+            f"Call {self.call_id} answered",
+            f"Call {self.call_id}: state -> ANSWERED",
+        )
 
     def answered(self, request: SIP.SIPMessage) -> None:
         if self.state != CallState.DIALING:
             return
+        debug(
+            request.summary(),
+            "Call answered by remote party "
+            + f"call_id={self.call_id} contact={request.headers.get('Contact')}",
+        )
 
         for i in request.body["m"]:
             if i["type"] == "video":  # Disable Video
@@ -344,6 +367,10 @@ class VoIPCall:
         self.request.headers["Contact"] = request.headers["Contact"]
         self.request.headers["To"]["tag"] = request.headers["To"]["tag"]
         self.state = CallState.ANSWERED
+        debug(
+            f"Call {self.call_id} connected",
+            f"Call {self.call_id}: state -> ANSWERED remote_contact={request.headers.get('Contact')}",
+        )
 
     def notFound(self, request: SIP.SIPMessage) -> None:
         warnings.warn(
@@ -406,6 +433,11 @@ class VoIPCall:
     def deny(self) -> None:
         if self.state != CallState.RINGING:
             raise InvalidStateError("Call is not ringing")
+        debug(
+            f"Denying call {self.call_id}",
+            f"Call {self.call_id}: denying incoming call",
+        )
+
         message = self.sip.gen_busy(self.request)
         self.sip.out.sendto(
             message.encode("utf8"), (self.phone.server, self.phone.port)
@@ -418,6 +450,11 @@ class VoIPCall:
     def hangup(self) -> None:
         if self.state != CallState.ANSWERED:
             raise InvalidStateError("Call is not answered")
+        debug(
+            f"Hanging up call {self.call_id}",
+            f"Call {self.call_id}: hangup requested",
+        )
+
         for x in self.RTPClients:
             x.stop()
         self.sip.bye(self.request)
@@ -427,6 +464,11 @@ class VoIPCall:
 
     def bye(self) -> None:
         if self.state == CallState.ANSWERED:
+            debug(
+                f"Remote BYE for {self.call_id}",
+                f"Call {self.call_id}: remote side ended the call",
+            )
+
             for x in self.RTPClients:
                 x.stop()
             self.state = CallState.ENDED
@@ -549,6 +591,12 @@ class VoIPPhone:
 
     def _callback_RESP_Provisional(self, request: SIP.SIPMessage) -> None:
         call_id = request.headers.get("Call-ID")
+        debug(
+            request.summary(),
+            "Call provisional response "
+            + f"call_id={call_id} status={int(request.status)} {request.status.phrase}",
+        )
+
         if call_id in self.calls:
             call = self.calls[call_id]
             if request.status in (SIP.SIPStatus.RINGING, SIP.SIPStatus.SESSION_PROGRESS):
@@ -568,6 +616,10 @@ class VoIPPhone:
         call_id = request.headers.get("Call-ID", "UNKNOWN")
         code = int(request.status)
         phrase = getattr(request.status, "phrase", "")
+        debug(
+            request.summary(),
+            f"Call failed call_id={call_id} status={code} {phrase}",
+        )
 
         # ACK final INVITE responses to stop retransmits.
         try:
@@ -611,6 +663,13 @@ class VoIPPhone:
 
     def _callback_MSG_Invite(self, request: SIP.SIPMessage) -> None:
         call_id = request.headers["Call-ID"]
+        debug(
+            request.summary(),
+            "Inbound INVITE "
+            + f"call_id={call_id} from={request.headers.get('From')} "
+            + f"to={request.headers.get('To')}",
+        )
+
         if call_id in self.calls:
             debug("Re-negotiation detected!")
             # TODO: this seems "dangerous" if for some reason sip server
@@ -657,6 +716,11 @@ class VoIPPhone:
     def _callback_MSG_Bye(self, request: SIP.SIPMessage) -> None:
         debug("BYE recieved")
         call_id = request.headers["Call-ID"]
+        debug(
+            request.summary(),
+            f"Inbound BYE call_id={call_id}",
+        )
+
         if call_id not in self.calls:
             return
         self.calls[call_id].bye()
@@ -664,6 +728,11 @@ class VoIPPhone:
     def _callback_RESP_OK(self, request: SIP.SIPMessage) -> None:
         debug("OK recieved")
         call_id = request.headers["Call-ID"]
+        debug(
+            request.summary(),
+            f"Call OK response call_id={call_id} status={int(request.status)} {request.status.phrase}",
+        )
+
         if call_id not in self.calls:
             debug("Unknown/No call")
             # Still ACK 200 OK to stop retransmits.
@@ -680,6 +749,11 @@ class VoIPPhone:
     def _callback_RESP_NotFound(self, request: SIP.SIPMessage) -> None:
         debug("Not Found recieved, invalid number called?")
         call_id = request.headers["Call-ID"]
+        debug(
+            request.summary(),
+            f"Call not found response call_id={call_id}",
+        )
+
         if call_id not in self.calls:
             debug("Unknown/No call")
             debug(
@@ -698,6 +772,11 @@ class VoIPPhone:
     def _callback_RESP_Unavailable(self, request: SIP.SIPMessage) -> None:
         debug("Service Unavailable recieved")
         call_id = request.headers["Call-ID"]
+        debug(
+            request.summary(),
+            f"Call unavailable response call_id={call_id}",
+        )
+
         if call_id not in self.calls:
             debug("Unkown call")
             debug(
@@ -760,6 +839,36 @@ class VoIPPhone:
         request, call_id, sess_id = self.sip.invite(
             number, medias, RTP.TransmitType.SENDRECV
         )
+
+        call = VoIPCall(
+            self,
+            CallState.DIALING,
+            request,
+            sess_id,
+            self.myIP,
+            ms=medias,
+            sendmode=self.sendmode,
+        )
+        self.calls[call_id] = call
+        debug(
+            request.summary(),
+            "Outbound call created "
+            + f"call_id={call_id} number={number} session_id={sess_id} "
+            + f"local_rtp_ports={list(medias.keys())}",
+        )
+
+        pending_response = self.sip.pop_pending_invite_response(call_id)
+        if pending_response is not None:
+            debug(
+                pending_response.summary(),
+                "Applying queued final INVITE response "
+                + f"call_id={call_id} status={int(pending_response.status)} "
+                + f"{pending_response.status.phrase}",
+            )
+            self.callback(pending_response)
+
+        return call
+
         self.calls[call_id] = VoIPCall(
             self,
             CallState.DIALING,

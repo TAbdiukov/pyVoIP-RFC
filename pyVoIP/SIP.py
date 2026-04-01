@@ -912,6 +912,29 @@ class SIPClient:
         self.registerThread: Optional[Timer] = None
         self.registerFailures = 0
         self.recvLock = Lock()
+        self.pending_invite_responses: Dict[str, SIPMessage] = {}
+        self.last_invite_debug: Dict[str, Any] = {}
+
+    def _set_last_invite_debug(self, **kwargs) -> None:
+        self.last_invite_debug.update(kwargs)
+        self.last_invite_debug["updated_at"] = time.time()
+
+    def invite_debug_snapshot(self) -> Dict[str, Any]:
+        return dict(self.last_invite_debug)
+
+    def pop_pending_invite_response(self, call_id: str) -> Optional[SIPMessage]:
+        return self.pending_invite_responses.pop(call_id, None)
+
+    @staticmethod
+    def _summarize_media(
+        ms: Dict[int, Dict[str, "RTP.PayloadType"]]
+    ) -> Dict[str, Dict[str, str]]:
+        summary: Dict[str, Dict[str, str]] = {}
+        for port, codecs in ms.items():
+            summary[str(port)] = {
+                str(payload): str(codec) for payload, codec in codecs.items()
+            }
+        return summary
 
     def _gen_sip_version_not_supported_raw(self, raw: bytes) -> str:
         """
@@ -1021,6 +1044,16 @@ class SIPClient:
     def parse_message(self, message: SIPMessage) -> None:
         # Responses (SIP/2.0 ...)
         if message.type != SIPMessageType.MESSAGE:
+            cseq = message.headers.get("CSeq", {})
+            cseq_method = cseq.get("method") if isinstance(cseq, dict) else cseq
+            debug(
+                message.summary(),
+                "SIP response "
+                + f"call_id={message.headers.get('Call-ID')} "
+                + f"cseq={cseq_method} "
+                + f"status={int(message.status)} {message.status.phrase}",
+            )
+
             if self.callCallback is not None:
                 try:
                     self.callCallback(message)
@@ -1743,11 +1776,39 @@ class SIPClient:
         branch = "z9hG4bK" + self.gen_call_id()[0:25]
         call_id = self.gen_call_id()
         sess_id = self.sessID.next()
+        media_summary = self._summarize_media(ms)
+        self._set_last_invite_debug(
+            event="invite-created",
+            status="dialing",
+            number=number,
+            call_id=call_id,
+            sess_id=sess_id,
+            branch=branch,
+            local_addr=f"{self.myIP}:{self.myPort}",
+            target=f"{self.server}:{self.port}",
+            media=media_summary,
+            sendtype=str(sendtype),
+            status_code=None,
+            phrase=None,
+            description=None,
+            response_heading=None,
+            retries=0,
+            error=None,
+        )
+        debug(
+            f"INVITE created for {number}",
+            "INVITE created "
+            + f"call_id={call_id} number={number} "
+            + f"branch={branch} sess_id={sess_id} "
+            + f"target={self.server}:{self.port} media={media_summary}",
+        )
+
         invite = self.gen_invite(
             number, str(sess_id), ms, sendtype, branch, call_id
         )
         with self.recvLock:
             self.out.sendto(invite.encode("utf8"), (self.server, self.port))
+            self._set_last_invite_debug(event="invite-sent")
             debug("Invited")
             deadline = time.monotonic() + self.invite_timeout
             retries = 0
@@ -1768,9 +1829,34 @@ class SIPClient:
                     continue
 
                 status_code = int(response.status)
+                self._set_last_invite_debug(
+                    event="invite-response",
+                    status_code=status_code,
+                    phrase=response.status.phrase,
+                    description=response.status.description,
+                    response_heading=str(
+                        response.heading, "utf8", errors="replace"
+                    ),
+                )
+                debug(
+                    response.summary(),
+                    "INVITE response "
+                    + f"call_id={call_id} "
+                    + f"status={status_code} {response.status.phrase}",
+                )
 
                 # Any 1xx response is "call progressing". Return control.
                 if 100 <= status_code < 200:
+                    self._set_last_invite_debug(
+                        event="invite-provisional",
+                        status=(
+                            "ringing"
+                            if response.status
+                            in (SIPStatus.RINGING, SIPStatus.SESSION_PROGRESS)
+                            else "dialing"
+                        ),
+                    )
+
                     return SIPMessage(invite.encode("utf8")), call_id, sess_id
 
                 # Digest challenges (401 / 407)
@@ -1806,11 +1892,34 @@ class SIPClient:
                     )
                     self.out.sendto(invite.encode("utf8"), (self.server, self.port))
                     retries += 1
+                    self._set_last_invite_debug(
+                        event="invite-auth-sent",
+                        status="auth",
+                        retries=retries,
+                    )
+                    debug(
+                        invite,
+                        "INVITE authentication retry "
+                        + f"call_id={call_id} retries={retries} "
+                        + f"status={status_code} {response.status.phrase}",
+                    )
 
                     # Return now; receive loop handles subsequent messages.
                     return SIPMessage(invite.encode("utf8")), call_id, sess_id
 
                 # Final response (>=200) — don't hang waiting for only 100/180.
+                self.pending_invite_responses[call_id] = response
+                self._set_last_invite_debug(
+                    event="invite-final-queued",
+                    status=("failed" if status_code >= 300 else "final"),
+                    status_code=status_code,
+                    phrase=response.status.phrase,
+                    description=response.status.description,
+                    response_heading=str(
+                        response.heading, "utf8", errors="replace"
+                    ),
+                )
+
                 debug(
                     response.summary(),
                     f"INVITE got final response {status_code} {response.status.phrase} "
@@ -1823,6 +1932,15 @@ class SIPClient:
                 extra = " Last response: " + str(
                     last_response.heading, "utf8", errors="replace"
                 )
+            self._set_last_invite_debug(
+                event="invite-timeout",
+                status="failed",
+                error=(
+                    f"INVITE timed out after {self.invite_timeout}s"
+                    + (extra if extra else "")
+                ),
+            )
+
             raise TimeoutError(
                 f"INVITE timed out after {self.invite_timeout}s (Call-ID={call_id}).{extra}"
             )

@@ -323,6 +323,7 @@ class RTPClient:
         self.inPort = inPort
         self.outIP = outIP
         self.outPort = outPort
+        self.sendrecv = sendrecv
 
         self.dtmf = dtmf
 
@@ -333,8 +334,21 @@ class RTPClient:
         self.outSequence = random.randint(1, 100)
         self.outTimestamp = random.randint(1, 10000)
         self.outSSRC = random.randint(1000, 65530)
+        debug(
+            f"Prepared RTP client {inIP}:{inPort}->{outIP}:{outPort}",
+            "RTP prepared "
+            + f"local={inIP}:{inPort} remote={outIP}:{outPort} "
+            + f"mode={sendrecv} codec={self.preference}",
+        )
 
     def start(self) -> None:
+        debug(
+            f"Starting RTP client {self.inIP}:{self.inPort}",
+            "RTP start "
+            + f"local={self.inIP}:{self.inPort} remote={self.outIP}:{self.outPort} "
+            + f"mode={self.sendrecv} codec={self.preference}",
+        )
+
         self.sin = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Some systems just reply to the port they receive from instead of
         # listening to the SDP.
@@ -350,6 +364,12 @@ class RTPClient:
         t.start()
 
     def stop(self) -> None:
+        debug(
+            f"Stopping RTP client {self.inIP}:{self.inPort}",
+            "RTP stop "
+            + f"local={self.inIP}:{self.inPort} remote={self.outIP}:{self.outPort}",
+        )
+
         self.NSD = False
         self.sin.close()
         self.sout.close()
