@@ -1761,6 +1761,36 @@ class SIPClient:
 
         return invRequest
 
+    def genCancel(self, request: SIPMessage) -> str:
+        warnings.warn(
+            "genCancel is deprecated due to PEP8 compliance. "
+            + "Use gen_cancel instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.gen_cancel(request)
+
+    def gen_cancel(self, request: SIPMessage) -> str:
+        cancel_request = f"CANCEL {request.uri} SIP/2.0\r\n"
+        cancel_request += self._gen_response_via_header(request)
+        cancel_request += "Max-Forwards: 70\r\n"
+        cancel_request += f"To: {request.headers['To']['raw']}\r\n"
+        cancel_request += (
+            f"From: {request.headers['From']['raw']};tag="
+            + f"{request.headers['From']['tag']}\r\n"
+        )
+        cancel_request += f"Call-ID: {request.headers['Call-ID']}\r\n"
+        cancel_request += (
+            f"CSeq: {request.headers['CSeq']['check']} CANCEL\r\n"
+        )
+        cancel_request += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
+        cancel_request += "Content-Length: 0\r\n\r\n"
+        return cancel_request
+
+    def cancel(self, request: SIPMessage) -> None:
+        message = self.gen_cancel(request)
+        self.out.sendto(message.encode("utf8"), (self.server, self.port))
+
     def genBye(self, request: SIPMessage) -> str:
         warnings.warn(
             "genBye is deprecated due to PEP8 compliance. "

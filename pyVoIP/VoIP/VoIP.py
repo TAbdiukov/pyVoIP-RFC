@@ -264,6 +264,15 @@ class VoIPCall:
             packet = self.dtmf.read(length)
             return packet
 
+    def _finalize_ended_call(self) -> None:
+        try:
+            self.phone.release_ports(call=self)
+        except Exception:
+            pass
+
+        if self.call_id in self.phone.calls:
+            del self.phone.calls[self.call_id]
+
     def genMs(self) -> Dict[int, Dict[int, RTP.PayloadType]]:
         warnings.warn(
             "genMs is deprecated due to PEP8 compliance. "
@@ -395,7 +404,7 @@ class VoIPCall:
         for x in self.RTPClients:
             x.stop()
         self.state = CallState.ENDED
-        del self.phone.calls[self.request.headers["Call-ID"]]
+        self._finalize_ended_call()
         debug("Call not found and terminated")
         warnings.warn(
             f"The number '{request.headers['To']['number']}' "
@@ -420,7 +429,7 @@ class VoIPCall:
         for x in self.RTPClients:
             x.stop()
         self.state = CallState.ENDED
-        del self.phone.calls[self.request.headers["Call-ID"]]
+        self._finalize_ended_call()
         debug("Call unavailable and terminated")
         warnings.warn(
             f"The number '{request.headers['To']['number']}' "
@@ -447,7 +456,21 @@ class VoIPCall:
         for x in self.RTPClients:
             x.stop()
         self.state = CallState.ENDED
-        del self.phone.calls[self.request.headers["Call-ID"]]
+        self._finalize_ended_call()
+
+    def cancel(self) -> None:
+        if self.state not in (CallState.DIALING, CallState.RINGING):
+            raise InvalidStateError("Call is not dialing")
+        debug(
+            f"Cancelling call {self.call_id}",
+            f"Call {self.call_id}: cancel requested",
+        )
+
+        for x in self.RTPClients:
+            x.stop()
+        self.sip.cancel(self.request)
+        self.state = CallState.ENDED
+        self._finalize_ended_call()
 
     def hangup(self) -> None:
         if self.state != CallState.ANSWERED:
@@ -461,8 +484,7 @@ class VoIPCall:
             x.stop()
         self.sip.bye(self.request)
         self.state = CallState.ENDED
-        if self.request.headers["Call-ID"] in self.phone.calls:
-            del self.phone.calls[self.request.headers["Call-ID"]]
+        self._finalize_ended_call()
 
     def bye(self) -> None:
         if self.state == CallState.ANSWERED:
@@ -474,8 +496,7 @@ class VoIPCall:
             for x in self.RTPClients:
                 x.stop()
             self.state = CallState.ENDED
-        if self.request.headers["Call-ID"] in self.phone.calls:
-            del self.phone.calls[self.request.headers["Call-ID"]]
+        self._finalize_ended_call()
 
     def writeAudio(self, data: bytes) -> None:
         warnings.warn(

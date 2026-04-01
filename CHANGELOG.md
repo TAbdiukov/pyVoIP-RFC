@@ -3,6 +3,7 @@
 
 ## 1.7.0+RFC
 
+- SIP - call cancellations
 - PyVOIP-RFC - Fix workflows
 - PyVOIP-RFC - Begin using telemetry for workflows
 - Debug: Add detailed outbound call telemetry (Call-ID, session ID, last SIP response, RTP ports, worker thread state)
