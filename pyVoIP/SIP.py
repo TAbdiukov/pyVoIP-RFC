@@ -873,6 +873,7 @@ class SIPClient:
         myPort=5060,
         callCallback: Optional[Callable[[SIPMessage], None]] = None,
         fatalCallback: Optional[Callable[..., None]] = None,
+        auth_username: Optional[str] = None,
     ):
         self.NSD = False
         self.server = server
@@ -880,6 +881,9 @@ class SIPClient:
         self.myIP = myIP
         self.username = username
         self.password = password
+        self.auth_username = (
+            username if auth_username is None else auth_username
+        )
 
         self.phone = phone
 
@@ -1246,8 +1250,17 @@ class SIPClient:
         return self.gen_authorization(request)
 
     def gen_authorization(self, request: SIPMessage) -> bytes:
+        header_name = request.authentication_header
+        if (
+            header_name is None
+            and request.status == SIPStatus.PROXY_AUTHENTICATION_REQUIRED
+        ):
+            header_name = "Proxy-Authenticate"
+
         realm = request.authentication["realm"]
-        HA1 = self.username + ":" + realm + ":" + self.password
+        user = self._auth_user_for_header(header_name)
+
+        HA1 = user + ":" + realm + ":" + self.password
         HA1 = hashlib.md5(HA1.encode("utf8")).hexdigest()
         HA2 = (
             ""
@@ -1387,11 +1400,22 @@ class SIPClient:
         return self.gen_register(request, deregister)
 
     def gen_register(self, request: SIPMessage, deregister=False) -> str:
-        response = str(self.gen_authorization(request), "utf8")
-        nonce = request.authentication["nonce"]
-        realm = request.authentication["realm"]
+        header_name = "Authorization"
+        if (
+            request.status == SIPStatus.PROXY_AUTHENTICATION_REQUIRED
+            or request.authentication_header == "Proxy-Authenticate"
+        ):
+            header_name = "Proxy-Authorization"
+
+        auth_line = self._build_digest_auth_header(
+            request,
+            header_name=header_name,
+            method="REGISTER",
+            uri=f"sip:{self.server};transport=UDP",
+        )
 
         regRequest = f"REGISTER sip:{self.server} SIP/2.0\r\n"
+
         regRequest += (
             f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};branch="
             + f"{self.gen_branch()};rport\r\n"
@@ -1422,12 +1446,8 @@ class SIPClient:
             "Expires: "
             + f"{self.default_expires if not deregister else 0}\r\n"
         )
-        regRequest += (
-            f'Authorization: Digest username="{self.username}",'
-            + f'realm="{realm}",nonce="{nonce}",'
-            + f'uri="sip:{self.server};transport=UDP",'
-            + f'response="{response}",algorithm=MD5\r\n'
-        )
+        
+        regRequest += auth_line
         regRequest += "Content-Length: 0"
         regRequest += "\r\n\r\n"
 
@@ -1954,6 +1974,11 @@ class SIPClient:
         except Exception:
             return branch + "1"
 
+    def _auth_user_for_header(self, header_name: Optional[str]) -> str:
+        if header_name in ("Proxy-Authenticate", "Proxy-Authorization"):
+            return self.auth_username
+        return self.username
+
     def _build_digest_auth_header(
         self,
         challenge: SIPMessage,
@@ -1975,7 +2000,11 @@ class SIPClient:
         def md5_hex(s: str) -> str:
             return hashlib.md5(s.encode("utf8")).hexdigest()
 
-        ha1 = md5_hex(f"{self.username}:{realm}:{self.password}")
+        auth_user = self._auth_user_for_header(
+            header_name or challenge.authentication_header
+        )
+
+        ha1 = md5_hex(f"{auth_user}:{realm}:{self.password}")
         ha2 = md5_hex(f"{method}:{uri}")
 
         qop_token: Optional[str] = None
@@ -1994,7 +2023,7 @@ class SIPClient:
             response = md5_hex(f"{ha1}:{nonce}:{ha2}")
 
         header = (
-            f'{header_name}: Digest username="{self.username}",'
+            f'{header_name}: Digest username="{auth_user}",'
             f'realm="{realm}",nonce="{nonce}",uri="{uri}",response="{response}"'
         )
         if opaque:
@@ -2049,8 +2078,11 @@ class SIPClient:
         response = SIPMessage(resp)
         response = self.trying_timeout_check(response)
 
-        if response.status == SIPStatus(401):
-            # Unauthorized, likely due to being password protected.
+        if response.status in (
+            SIPStatus.UNAUTHORIZED,
+            SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+        ):
+            # 401 Unauthorized or 407 Proxy Authentication Required.
             regRequest = self.gen_register(response, deregister=True)
             self.out.sendto(
                 regRequest.encode("utf8"), (self.server, self.port)
@@ -2059,15 +2091,16 @@ class SIPClient:
             if ready[0]:
                 resp = self.s.recv(8192)
                 response = SIPMessage(resp)
-                if response.status == SIPStatus(401):
+                if response.status in (
+                    SIPStatus.UNAUTHORIZED,
+                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+                ):
                     # At this point, it's reasonable to assume that
                     # this is caused by invalid credentials.
                     debug("Unauthorized")
                     raise InvalidAccountInfoError(
-                        "Invalid Username or "
-                        + "Password for SIP server "
-                        + f"{self.server}:"
-                        + f"{self.myPort}"
+                        "Invalid authentication credentials for SIP server "
+                        + f"{self.server}:{self.myPort}"
                     )
                 elif response.status == SIPStatus(400):
                     # Bad Request
@@ -2153,8 +2186,11 @@ class SIPClient:
             # with new urn:uuid or reply with expire 0
             self._handle_bad_request()
 
-        if response.status == SIPStatus(401):
-            # Unauthorized, likely due to being password protected.
+        if response.status in (
+            SIPStatus.UNAUTHORIZED,
+            SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+        ):
+            # 401 Unauthorized or 407 Proxy Authentication Required.
             regRequest = self.gen_register(response)
             self.out.sendto(
                 regRequest.encode("utf8"), (self.server, self.port)
@@ -2164,7 +2200,10 @@ class SIPClient:
                 resp = self.s.recv(8192)
                 response = SIPMessage(resp)
                 response = self.trying_timeout_check(response)
-                if response.status == SIPStatus(401):
+                if response.status in (
+                    SIPStatus.UNAUTHORIZED,
+                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+                ):
                     # At this point, it's reasonable to assume that
                     # this is caused by invalid credentials.
                     debug("=" * 50)
@@ -2179,10 +2218,8 @@ class SIPClient:
                     debug(response.summary())
                     debug("=" * 50)
                     raise InvalidAccountInfoError(
-                        "Invalid Username or "
-                        + "Password for SIP server "
-                        + f"{self.server}:"
-                        + f"{self.myPort}"
+                        "Invalid authentication credentials for SIP server "
+                        + f"{self.server}:{self.myPort}"
                     )
                 elif response.status == SIPStatus(400):
                     # Bad Request
@@ -2192,11 +2229,6 @@ class SIPClient:
                     self._handle_bad_request()
             else:
                 raise TimeoutError("Registering on SIP Server timed out")
-
-        if response.status == SIPStatus(407):
-            # Proxy Authentication Required
-            # TODO: implement
-            debug("Proxy auth required")
 
         # TODO: This must be done more reliable
         if response.status not in [
@@ -2219,9 +2251,8 @@ class SIPClient:
             return True
         else:
             raise InvalidAccountInfoError(
-                "Invalid Username or Password for "
-                + f"SIP server {self.server}:"
-                + f"{self.myPort}"
+                "Invalid authentication credentials for SIP server "
+                + f"{self.server}:{self.myPort}"
             )
 
     def _handle_bad_request(self) -> None:

@@ -522,6 +522,7 @@ class VoIPPhone:
         sipPort=5060,
         rtpPortLow=10000,
         rtpPortHigh=20000,
+        auth_username: Optional[str] = None,
     ):
         if rtpPortLow > rtpPortHigh:
             raise InvalidRangeError("'rtpPortHigh' must be >= 'rtpPortLow'")
@@ -539,6 +540,9 @@ class VoIPPhone:
         self.myIP = myIP
         self.username = username
         self.password = password
+        self.auth_username = (
+            username if auth_username is None else auth_username
+        )
         self.callCallback = callCallback
         self._status = PhoneStatus.INACTIVE
 
@@ -560,6 +564,7 @@ class VoIPPhone:
             myPort=sipPort,
             callCallback=self.callback,
             fatalCallback=self.fatal,
+            auth_username=self.auth_username,
         )
 
     def callback(self, request: SIP.SIPMessage) -> None:

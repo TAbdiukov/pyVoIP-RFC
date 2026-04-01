@@ -68,7 +68,7 @@ SIPClient
 
 The SIPClient class is used to communicate with the PBX/VoIP server.  It is responsible for registering with the server, and receiving phone calls.
 
-*class* SIP.\ **SIPClient**\ (server: str, port: int, username: str, password: str, myIP="0.0.0.0", myPort=5060, callCallback: Optional[Callable[[SIPMessage], None]] = None)
+*class* SIP.\ **SIPClient**\ (server: str, port: int, username: str, password: str, phone: VoIPPhone, myIP="0.0.0.0", myPort=5060, callCallback: Optional[Callable[[SIPMessage], None]] = None, fatalCallback: Optional[Callable[..., None]] = None, auth_username: Optional[str] = None)
     The *server* argument is your PBX/VoIP server's IP.
     
     The *port* argument is your PBX/VoIP server's port.
@@ -77,11 +77,17 @@ The SIPClient class is used to communicate with the PBX/VoIP server.  It is resp
 
     The *password* argument is your SIP account password on the PBX/VoIP server.
 
+	The *phone* argument is the owning :ref:`VoIPPhone` instance.
+
     The *myIP* argument is used to bind a socket and receive incoming SIP requests and responses.
 
     The *myPort* argument is the port SIPClient will bind to, to receive incoming SIP requests and responses. The default for this protocol is port 5060, but any port can be used.
 
     The *callCallback* argument is the callback function for :ref:`VoIPPhone`.  VoIPPhone will process the SIP request, and perform the appropriate actions.
+
+    The *fatalCallback* argument is called when repeated SIP registration failures cause the owning phone to stop.
+
+    The *auth_username* argument is an optional digest username to use for proxy-authentication challenges such as SIP 407.  If omitted, *username* is reused.
 
   **recv**\ () -> None
     This method is called by SIPClient.start() and is responsible for receiving and parsing through SIP requests.  **This should not be called by the** :term:`user`.
