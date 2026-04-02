@@ -1,15 +1,19 @@
 # Changelog
 
 
-## 1.7.0+RFC
+## 1.7.2+RFC
 
 - PyVOIP-RFC - Add DMTF support
+- VoIP - Backport authentication support from pyVoIP 2.x.x
+- VoIP - Hangup call support
 - SIP - call cancellations
 - PyVOIP-RFC - Fix workflows
 - PyVOIP-RFC - Begin using telemetry for workflows
 - Debug: Add detailed outbound call telemetry (Call-ID, session ID, last SIP response, RTP ports, worker thread state)
 - Debug: Timestamp pyVoIP debug output and trace INVITE progress/auth/final responses in more detail
 - VoIP: Preserve fast final INVITE responses so they can still be inspected after the VoIPCall object is created
+
+## 1.7.0+RFC
 
 
 - RTP: Fix integer overflow after ~22 min at 20ms for PCMU/PCMA
