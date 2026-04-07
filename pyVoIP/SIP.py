@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from threading import Timer, Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -26,6 +27,7 @@ __all__ = [
     "SIPMessage",
     "SIPMessageType",
     "SIPParseError",
+    "SIPSubscription",
     "SIPStatus",
 ]
 
@@ -43,6 +45,53 @@ class SIPParseError(Exception):
 
 class RetryRequiredError(Exception):
     pass
+
+
+@dataclass
+class SIPSubscription:
+    call_id: str
+    target: str
+    target_uri: str
+    event: str
+    accept: List[str]
+    local_tag: str
+    remote_tag: str = ""
+    remote_target: Optional[str] = None
+    expires: int = 3600
+    pending_expires: int = 3600
+    status: str = "pending"
+    subscription_state: Optional[str] = None
+    reason: Optional[str] = None
+    last_response_code: Optional[int] = None
+    last_response_phrase: Optional[str] = None
+    last_notify_body: str = ""
+    last_notify_headers: Dict[str, str] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "call_id": self.call_id,
+            "target": self.target,
+            "target_uri": self.target_uri,
+            "event": self.event,
+            "accept": list(self.accept),
+            "local_tag": self.local_tag,
+            "remote_tag": self.remote_tag,
+            "remote_target": self.remote_target,
+            "expires": self.expires,
+            "pending_expires": self.pending_expires,
+            "status": self.status,
+            "subscription_state": self.subscription_state,
+            "reason": self.reason,
+            "last_response_code": self.last_response_code,
+            "last_response_phrase": self.last_response_phrase,
+            "last_notify_body": self.last_notify_body,
+            "last_notify_headers": dict(self.last_notify_headers),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
 
 
 class Counter:
@@ -350,6 +399,8 @@ class SIPMessage:
         # Which header populated `self.authentication` (WWW-Authenticate,
         # Proxy-Authenticate, Authorization, Proxy-Authorization).
         self.authentication_header: Optional[str] = None
+        self.body_raw = b""
+        self.body_text = ""
         self.raw = data
         self.auth_match = re.compile(r'(\w+)=("[^",]+"|[^ \t,]+)')
         self.parse(data)
@@ -812,6 +863,9 @@ class SIPMessage:
             headers, body = data.split(b"\r\n\r\n", 1)
         except ValueError:
             headers, body = data, b""
+        self.body_raw = body
+        self.body_text = str(body, "utf8", errors="replace")
+
 
         headers_raw = headers.split(b"\r\n")
         self.heading = headers_raw.pop(0)
@@ -839,6 +893,9 @@ class SIPMessage:
             headers, body = data.split(b"\r\n\r\n", 1)
         except ValueError:
             headers, body = data, b""
+
+        self.body_raw = body
+        self.body_text = str(body, "utf8", errors="replace")
 
         headers_raw = headers.split(b"\r\n")
         self.heading = headers_raw.pop(0)
@@ -903,6 +960,8 @@ class SIPClient:
         self.invite_timeout = 30
         # Max times to retry INVITE after 401/407.
         self.invite_max_retries = 1
+        self.subscription_timeout = 15
+        self.subscription_max_retries = 1
 
         self.inviteCounter = Counter()
         self.registerCounter = Counter()
@@ -918,6 +977,10 @@ class SIPClient:
         self.recvLock = Lock()
         self.pending_invite_responses: Dict[str, SIPMessage] = {}
         self.last_invite_debug: Dict[str, Any] = {}
+        self.subscription_callback: Optional[
+            Callable[[Dict[str, Any]], None]
+        ] = None
+        self.subscriptions: Dict[str, SIPSubscription] = {}
 
     @staticmethod
     def _extract_uri(value: str) -> str:
@@ -975,6 +1038,653 @@ class SIPClient:
                 str(payload): str(codec) for payload, codec in codecs.items()
             }
         return summary
+
+
+    @staticmethod
+    def _normalize_subscription_event(event: str) -> str:
+        raw = str(event or "presence").strip()
+        if not raw:
+            raw = "presence"
+
+        parts = [part.strip() for part in raw.split(";") if part.strip()]
+        if not parts:
+            return "presence"
+
+        aliases = {
+            "mwi": "message-summary",
+            "message_waiting": "message-summary",
+            "registration": "reg",
+            "registrations": "reg",
+            "call-state": "dialog",
+            "dialog-info": "dialog",
+        }
+        parts[0] = aliases.get(parts[0].lower(), parts[0].lower())
+        return ";".join(parts)
+
+    def _default_subscription_accept(self, event: str) -> List[str]:
+        event_name = self._normalize_subscription_event(event).split(";", 1)[0]
+        if event_name == "presence":
+            return [
+                "application/pidf+xml",
+                "application/pidf-diff+xml",
+                "application/xpidf+xml",
+                "text/plain",
+            ]
+        if event_name == "dialog":
+            return [
+                "application/dialog-info+xml",
+                "application/xml",
+                "text/plain",
+            ]
+        if event_name == "message-summary":
+            return ["application/simple-message-summary"]
+        if event_name == "reg":
+            return [
+                "application/reginfo+xml",
+                "application/xml",
+                "text/plain",
+            ]
+        return ["application/xml", "text/plain"]
+
+    def _normalize_subscription_target(self, target: str) -> str:
+        target = str(target or "").strip()
+        if not target:
+            raise ValueError("Subscription target cannot be empty.")
+
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1].strip()
+
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
+            return target
+
+        if "@" in target:
+            return f"sip:{target}"
+
+        return f"sip:{target}@{self.server}"
+
+    def _subscription_send_target(
+        self, subscription: SIPSubscription
+    ) -> Tuple[str, int]:
+        if subscription.remote_target:
+            return self._sip_target_from_uri(
+                subscription.remote_target, self.port
+            )
+        return self.server, self.port
+
+    def _subscription_to_header(self, subscription: SIPSubscription) -> str:
+        line = f"<{subscription.target_uri}>"
+        if subscription.remote_tag:
+            line += f";tag={subscription.remote_tag}"
+        return line
+
+    def _build_subscribe_request(
+        self,
+        subscription: SIPSubscription,
+        *,
+        expires: int,
+        auth_line: str = "",
+        request_uri: Optional[str] = None,
+    ) -> str:
+        request_uri = (
+            request_uri
+            or subscription.remote_target
+            or subscription.target_uri
+        )
+
+        request = f"SUBSCRIBE {request_uri} SIP/2.0\r\n"
+        request += (
+            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
+            + f"branch={self.gen_branch()};rport\r\n"
+        )
+        request += "Max-Forwards: 70\r\n"
+        request += (
+            "Contact: "
+            + f"<sip:{self.username}@{self.myIP}:{self.myPort};"
+            + "transport=UDP>\r\n"
+        )
+        request += f"To: {self._subscription_to_header(subscription)}\r\n"
+        request += (
+            f"From: <sip:{self.username}@{self.server}>;"
+            + f"tag={subscription.local_tag}\r\n"
+        )
+        request += f"Call-ID: {subscription.call_id}\r\n"
+        request += f"CSeq: {self.subscribeCounter.next()} SUBSCRIBE\r\n"
+        request += f"Event: {subscription.event}\r\n"
+        request += f"Expires: {max(0, int(expires))}\r\n"
+        if subscription.accept:
+            request += "Accept: " + ", ".join(subscription.accept) + "\r\n"
+        request += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
+        request += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
+        if auth_line:
+            request += auth_line
+        request += "Content-Length: 0\r\n\r\n"
+        return request
+
+    def _send_request_response(
+        self, request: SIPMessage, response: str
+    ) -> None:
+        try:
+            sender_address, sender_port = request.headers["Via"][0]["address"]
+            self.out.sendto(
+                response.encode("utf8"),
+                (sender_address, int(sender_port)),
+            )
+        except Exception:
+            self.out.sendto(
+                response.encode("utf8"),
+                (self.server, self.port),
+            )
+
+    def gen_response(self, request: SIPMessage, status: SIPStatus) -> str:
+        response = f"SIP/2.0 {int(status)} {status.phrase}\r\n"
+        response += self._gen_response_via_header(request)
+
+        from_line = request.headers["From"]["raw"]
+        if request.headers["From"]["tag"]:
+            from_line += f";tag={request.headers['From']['tag']}"
+        response += f"From: {from_line}\r\n"
+
+        to_line = request.headers["To"]["raw"]
+        if request.headers["To"]["tag"]:
+            to_line += f";tag={request.headers['To']['tag']}"
+        else:
+            to_line += f";tag={self.gen_tag()}"
+        response += f"To: {to_line}\r\n"
+
+        response += f"Call-ID: {request.headers['Call-ID']}\r\n"
+        response += (
+            f"CSeq: {request.headers['CSeq']['check']} "
+            + f"{request.headers['CSeq']['method']}\r\n"
+        )
+        response += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
+        response += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
+        response += "Content-Length: 0\r\n\r\n"
+        return response
+
+    @staticmethod
+    def _parse_subscription_state(value: str) -> Dict[str, Any]:
+        raw = str(value or "").strip()
+        parts = [part.strip() for part in raw.split(";") if part.strip()]
+
+        params: Dict[str, Optional[str]] = {}
+        for part in parts[1:]:
+            if "=" in part:
+                key, val = part.split("=", 1)
+                params[key.lower()] = val.strip('"')
+            else:
+                params[part.lower()] = None
+
+        parsed: Dict[str, Any] = {
+            "state": parts[0].lower() if parts else "",
+            "reason": params.get("reason"),
+            "expires": None,
+            "retry_after": None,
+            "params": params,
+        }
+        for field_name, key in (
+            ("expires", "expires"),
+            ("retry_after", "retry-after"),
+        ):
+            field_value = params.get(key)
+            if field_value is not None:
+                try:
+                    parsed[field_name] = int(field_value)
+                except Exception:
+                    parsed[field_name] = None
+        return parsed
+
+    def _emit_subscription_event(
+        self,
+        subscription: SIPSubscription,
+        *,
+        event_type: str,
+        message: Optional[SIPMessage] = None,
+    ) -> Dict[str, Any]:
+        info = subscription.snapshot()
+        info["type"] = event_type
+
+        if message is not None and message.type == SIPMessageType.RESPONSE:
+            info["response_code"] = int(message.status)
+            info["response_phrase"] = message.status.phrase
+            info["response_heading"] = str(
+                message.heading, "utf8", errors="replace"
+            )
+        elif message is not None:
+            info["body"] = getattr(message, "body_text", "")
+            info["event_header"] = message.headers.get("Event")
+            info["content_type"] = message.headers.get("Content-Type")
+            info["subscription_state_header"] = message.headers.get(
+                "Subscription-State"
+            )
+        else:
+            info["body"] = subscription.last_notify_body
+
+        if self.subscription_callback is not None:
+            try:
+                self.subscription_callback(dict(info))
+            except Exception as ex:
+                debug(f"Exception in subscription_callback: {ex}")
+        return info
+
+    def _apply_subscribe_response(
+        self,
+        message: SIPMessage,
+        *,
+        emit_callback: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        call_id = str(message.headers.get("Call-ID", "") or "")
+        subscription = self.subscriptions.get(call_id)
+        if subscription is None:
+            return None
+
+        code = int(message.status)
+        subscription.updated_at = time.time()
+        subscription.last_response_code = code
+        subscription.last_response_phrase = message.status.phrase
+
+        to_header = message.headers.get("To")
+        if isinstance(to_header, dict) and to_header.get("tag"):
+            subscription.remote_tag = to_header["tag"]
+
+        contact = message.headers.get("Contact")
+        if contact:
+            subscription.remote_target = self._extract_uri(str(contact))
+
+        expires_header = message.headers.get("Expires")
+        if expires_header is not None:
+            try:
+                subscription.expires = int(expires_header)
+            except Exception:
+                pass
+
+        if 200 <= code < 300:
+            if subscription.pending_expires == 0 or subscription.expires == 0:
+                subscription.status = "cancelling"
+                subscription.reason = None
+            elif subscription.subscription_state in ("active", "pending"):
+                subscription.status = subscription.subscription_state
+                subscription.reason = None
+            else:
+                subscription.status = "pending"
+                subscription.reason = None
+        elif code == int(SIPStatus.CALL_OR_TRANSACTION_DOESNT_EXIST):
+            subscription.status = "terminated"
+            subscription.reason = f"{code} {message.status.phrase}"
+        else:
+            if subscription.subscription_state in ("active", "pending"):
+                subscription.status = subscription.subscription_state
+            else:
+                subscription.status = "failed"
+            subscription.reason = f"{code} {message.status.phrase}"
+
+        info = subscription.snapshot()
+        info["response_code"] = code
+        info["response_phrase"] = message.status.phrase
+        info["response_heading"] = str(
+            message.heading, "utf8", errors="replace"
+        )
+
+        if emit_callback:
+            info = self._emit_subscription_event(
+                subscription,
+                event_type="subscribe-response",
+                message=message,
+            )
+
+        if subscription.status == "terminated":
+            self.subscriptions.pop(subscription.call_id, None)
+
+        return info
+
+    def _handle_notify(self, message: SIPMessage) -> None:
+        call_id = str(message.headers.get("Call-ID", "") or "")
+        subscription = self.subscriptions.get(call_id)
+        to_header = message.headers.get("To", {})
+        local_tag = to_header.get("tag") if isinstance(to_header, dict) else ""
+        event_header = str(message.headers.get("Event", "") or "").strip()
+
+        if (
+            subscription is None
+            or (
+                subscription.local_tag
+                and local_tag
+                and local_tag != subscription.local_tag
+            )
+            or (
+                event_header
+                and self._normalize_subscription_event(event_header)
+                != self._normalize_subscription_event(subscription.event)
+            )
+        ):
+            response = self.gen_response(
+                message, SIPStatus.CALL_OR_TRANSACTION_DOESNT_EXIST
+            )
+            self._send_request_response(message, response)
+            return
+
+        subscription.updated_at = time.time()
+        from_header = message.headers.get("From")
+        if isinstance(from_header, dict) and from_header.get("tag"):
+            subscription.remote_tag = from_header["tag"]
+
+        contact = message.headers.get("Contact")
+        if contact:
+            subscription.remote_target = self._extract_uri(str(contact))
+
+        body_text = getattr(message, "body_text", "")
+        subscription.last_notify_body = body_text
+        subscription.last_notify_headers = {
+            "Event": str(message.headers.get("Event", "") or ""),
+            "Subscription-State": str(
+                message.headers.get("Subscription-State", "") or ""
+            ),
+            "Content-Type": str(message.headers.get("Content-Type", "") or ""),
+        }
+
+        parsed_state = self._parse_subscription_state(
+            subscription.last_notify_headers["Subscription-State"]
+        )
+        if parsed_state["state"]:
+            subscription.subscription_state = parsed_state["state"]
+            subscription.status = parsed_state["state"]
+        if parsed_state["reason"]:
+            subscription.reason = parsed_state["reason"]
+        if parsed_state.get("expires") is not None:
+            subscription.expires = parsed_state["expires"]
+
+        response = self.gen_ok(message)
+        self._send_request_response(message, response)
+
+        self._emit_subscription_event(
+            subscription,
+            event_type="notify",
+            message=message,
+        )
+        if subscription.subscription_state == "terminated":
+            self.subscriptions.pop(subscription.call_id, None)
+
+    def list_subscriptions(self) -> List[Dict[str, Any]]:
+        subscriptions = sorted(
+            self.subscriptions.values(),
+            key=lambda item: (item.target_uri, item.event, item.updated_at),
+        )
+        return [subscription.snapshot() for subscription in subscriptions]
+
+    def _find_subscription(
+        self, identifier: str, event: Optional[str] = None
+    ) -> Optional[SIPSubscription]:
+        ident = str(identifier or "").strip()
+        if not ident:
+            return None
+
+        event_name = (
+            self._normalize_subscription_event(event)
+            if event is not None
+            else None
+        )
+        ident_lower = ident.lower()
+        matches: List[SIPSubscription] = []
+        for subscription in self.subscriptions.values():
+            if (
+                event_name is not None
+                and self._normalize_subscription_event(subscription.event)
+                != event_name
+            ):
+                continue
+            if (
+                ident_lower == subscription.target.lower()
+                or ident_lower == subscription.target_uri.lower()
+                or ident_lower == subscription.call_id.lower()
+                or subscription.call_id.lower().startswith(ident_lower)
+            ):
+                matches.append(subscription)
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda item: item.updated_at, reverse=True)
+        return matches[0]
+
+    def subscribe_to(
+        self,
+        target: str,
+        *,
+        event: str = "presence",
+        expires: int = 3600,
+        accept: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if not self.NSD:
+            raise RuntimeError("SIP client is not running.")
+
+        target_uri = self._normalize_subscription_target(target)
+        event_name = self._normalize_subscription_event(event)
+        if accept is None:
+            accept_types = self._default_subscription_accept(event_name)
+        elif isinstance(accept, str):
+            accept_types = [x.strip() for x in accept.split(",") if x.strip()]
+        else:
+            accept_types = [x for x in accept if str(x).strip()]
+
+        subscription = SIPSubscription(
+            call_id=self.gen_call_id(),
+            target=str(target).strip(),
+            target_uri=target_uri,
+            event=event_name,
+            accept=accept_types,
+            local_tag=self.gen_tag(),
+            expires=max(0, int(expires)),
+            pending_expires=max(0, int(expires)),
+        )
+        self.subscriptions[subscription.call_id] = subscription
+        self.tagLibrary[subscription.call_id] = subscription.local_tag
+
+        request = self._build_subscribe_request(
+            subscription,
+            expires=subscription.pending_expires,
+        )
+
+        with self.recvLock:
+            self.out.sendto(
+                request.encode("utf8"),
+                self._subscription_send_target(subscription),
+            )
+            deadline = time.monotonic() + self.subscription_timeout
+            retries = 0
+
+            while self.NSD and time.monotonic() < deadline:
+                timeout = min(1.0, max(0.0, deadline - time.monotonic()))
+                ready = select.select([self.s], [], [], timeout)
+                if not ready[0]:
+                    continue
+
+                response = SIPMessage(self.s.recv(8192))
+                if response.type == SIPMessageType.MESSAGE:
+                    if response.method == "NOTIFY":
+                        self._handle_notify(response)
+                    else:
+                        self.parse_message(response)
+                    continue
+
+                cseq = response.headers.get("CSeq", {})
+                cseq_method = (
+                    cseq.get("method") if isinstance(cseq, dict) else None
+                )
+                if (
+                    response.headers.get("Call-ID") != subscription.call_id
+                    or cseq_method != "SUBSCRIBE"
+                ):
+                    self.parse_message(response)
+                    continue
+
+                status_code = int(response.status)
+                if 100 <= status_code < 200:
+                    continue
+
+                if response.status in (
+                    SIPStatus.UNAUTHORIZED,
+                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+                ) and retries < self.subscription_max_retries:
+                    header_name = "Authorization"
+                    if (
+                        response.status
+                        == SIPStatus.PROXY_AUTHENTICATION_REQUIRED
+                        or response.authentication_header
+                        == "Proxy-Authenticate"
+                    ):
+                        header_name = "Proxy-Authorization"
+
+                    auth_line = self._build_digest_auth_header(
+                        response,
+                        header_name=header_name,
+                        method="SUBSCRIBE",
+                        uri=subscription.remote_target
+                        or subscription.target_uri,
+                    )
+                    request = self._build_subscribe_request(
+                        subscription,
+                        expires=subscription.pending_expires,
+                        auth_line=auth_line,
+                    )
+                    self.out.sendto(
+                        request.encode("utf8"),
+                        self._subscription_send_target(subscription),
+                    )
+                    retries += 1
+                    continue
+
+                info = self._apply_subscribe_response(
+                    response,
+                    emit_callback=False,
+                ) or subscription.snapshot()
+                if 200 <= status_code < 300:
+                    return info
+
+                self.subscriptions.pop(subscription.call_id, None)
+                raise RuntimeError(
+                    f"SUBSCRIBE failed with SIP {status_code} "
+                    + f"{response.status.phrase} "
+                    + f"(Call-ID={subscription.call_id})."
+                )
+
+        self.subscriptions.pop(subscription.call_id, None)
+        raise TimeoutError(
+            f"SUBSCRIBE timed out after {self.subscription_timeout}s "
+            + f"(Call-ID={subscription.call_id})."
+        )
+
+    def unsubscribe_from(
+        self,
+        identifier: str,
+        *,
+        event: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not self.NSD:
+            raise RuntimeError("SIP client is not running.")
+
+        subscription = self._find_subscription(identifier, event=event)
+        if subscription is None:
+            raise KeyError(f"No active subscription matched '{identifier}'.")
+
+        previous_pending = subscription.pending_expires
+        subscription.pending_expires = 0
+        request = self._build_subscribe_request(subscription, expires=0)
+
+        with self.recvLock:
+            self.out.sendto(
+                request.encode("utf8"),
+                self._subscription_send_target(subscription),
+            )
+            deadline = time.monotonic() + self.subscription_timeout
+            retries = 0
+
+            while self.NSD and time.monotonic() < deadline:
+                timeout = min(1.0, max(0.0, deadline - time.monotonic()))
+                ready = select.select([self.s], [], [], timeout)
+                if not ready[0]:
+                    continue
+
+                response = SIPMessage(self.s.recv(8192))
+                if response.type == SIPMessageType.MESSAGE:
+                    if response.method == "NOTIFY":
+                        self._handle_notify(response)
+                    else:
+                        self.parse_message(response)
+                    continue
+
+                cseq = response.headers.get("CSeq", {})
+                cseq_method = (
+                    cseq.get("method") if isinstance(cseq, dict) else None
+                )
+                if (
+                    response.headers.get("Call-ID") != subscription.call_id
+                    or cseq_method != "SUBSCRIBE"
+                ):
+                    self.parse_message(response)
+                    continue
+
+                status_code = int(response.status)
+                if 100 <= status_code < 200:
+                    continue
+
+                if response.status in (
+                    SIPStatus.UNAUTHORIZED,
+                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+                ) and retries < self.subscription_max_retries:
+                    header_name = "Authorization"
+                    if (
+                        response.status
+                        == SIPStatus.PROXY_AUTHENTICATION_REQUIRED
+                        or response.authentication_header
+                        == "Proxy-Authenticate"
+                    ):
+                        header_name = "Proxy-Authorization"
+
+                    auth_line = self._build_digest_auth_header(
+                        response,
+                        header_name=header_name,
+                        method="SUBSCRIBE",
+                        uri=subscription.remote_target
+                        or subscription.target_uri,
+                    )
+                    request = self._build_subscribe_request(
+                        subscription,
+                        expires=0,
+                        auth_line=auth_line,
+                    )
+                    self.out.sendto(
+                        request.encode("utf8"),
+                        self._subscription_send_target(subscription),
+                    )
+                    retries += 1
+                    continue
+
+                info = self._apply_subscribe_response(
+                    response,
+                    emit_callback=False,
+                ) or subscription.snapshot()
+                if 200 <= status_code < 300:
+                    return info
+
+                if status_code == int(
+                    SIPStatus.CALL_OR_TRANSACTION_DOESNT_EXIST
+                ):
+                    self.subscriptions.pop(subscription.call_id, None)
+                    info["status"] = "terminated"
+                    return info
+
+                subscription.pending_expires = previous_pending
+                raise RuntimeError(
+                    f"Unsubscribe failed with SIP {status_code} "
+                    + f"{response.status.phrase} "
+                    + f"(Call-ID={subscription.call_id})."
+                )
+
+        subscription.pending_expires = previous_pending
+        raise TimeoutError(
+            f"Unsubscribe timed out after {self.subscription_timeout}s "
+            + f"(Call-ID={subscription.call_id})."
+        )
+
 
     def _gen_sip_version_not_supported_raw(self, raw: bytes) -> str:
         """
@@ -1120,6 +1830,9 @@ class SIPClient:
                     response_heading=str(message.heading, "utf8", errors="replace"),
                     error=None,
                 )
+
+            if cseq_method == "SUBSCRIBE":
+                self._apply_subscribe_response(message)
 
             if self.callCallback is not None:
                 try:
@@ -2373,18 +3086,21 @@ class SIPClient:
         debug("Bad Request")
 
     def subscribe(self, lastresponse: SIPMessage) -> None:
-        # TODO: check if needed and maybe implement fully
-        with self.recvLock:
-            subRequest = self.gen_subscribe(lastresponse)
-            self.out.sendto(
-                subRequest.encode("utf8"), (self.server, self.port)
+        warnings.warn(
+            "subscribe(SIPMessage) is deprecated. "
+            + "Use subscribe_to(...) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        try:
+            self.subscribe_to(
+                self.username,
+                event="message-summary",
+                expires=self.default_expires * 2,
+                accept=["application/simple-message-summary"],
             )
-
-            response = SIPMessage(self.s.recv(8192))
-
-            debug(
-                f'Got response to subscribe: {str(response.heading, "utf8")}'
-            )
+        except Exception as ex:
+            debug(f"Legacy subscribe failed: {ex}")
 
     def trying_timeout_check(self, response: SIPMessage) -> SIPMessage:
         """
