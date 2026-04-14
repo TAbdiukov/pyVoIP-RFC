@@ -3,6 +3,7 @@
 
 ## 2.7.3+RFC
 
+- PyVOIP-RFC: Fix double free() for ports.
 - PyVOIP-RFC: Bump version to 2.x.. (since PyVOIP v2 changes were backported)
 - PyVOIP-RFC: Consolidate version handling
 - Fix changelog
