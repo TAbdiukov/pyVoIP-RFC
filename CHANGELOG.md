@@ -30,6 +30,8 @@
 - SIP: Fix usage of uninitiated variable
 - VoIP: Record port used
 
+## 1.7.0+RFC (RC2)
+
 - RTP: Fix RTP sequence/timestamp overflow resulting in corruption
 - RTP: Better payload bytes handling
 - SIP: Fix: Header parsing was too strict and could cause crashes
@@ -37,6 +39,8 @@
 - SIP: More robust rtpmap / a=fmtp parsing
 - SIP: Fix: SIPParseError was never raised in SIPClient.recv()
 - setup.py: Update package name and bump version
+
+## 1.7.0+RFC (RC1)
 
 - SIP: Fix crash on unknown request type
 - SIP: Implement and wire basic OPTIONS support
