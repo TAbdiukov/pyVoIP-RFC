@@ -1,6 +1,13 @@
 # Changelog
 
 
+## 2.7.4+RFC
+
+- SIP: Add outbound proxy support across REGISTER, INVITE, ACK, CANCEL, BYE, and SUBSCRIBE flows.
+- SIP: Route inbound INVITE responses (180/200/486/etc.) back to the requester instead of always using the configured registrar target.
+- VoIP: Expose proxy configuration on `VoIPPhone` via `proxy` / `proxyPort`.
+- Docs: Add README example for outbound proxy usage.
+
 ## 2.7.3+RFC
 
 - PyVOIP-RFC: Fix double free() for ports.
@@ -19,7 +26,6 @@
 - VoIP: Preserve fast final INVITE responses so they can still be inspected after the VoIPCall object is created
 
 ## 1.7.0+RFC
-
 
 - RTP: Fix integer overflow after ~22 min at 20ms for PCMU/PCMA
 - RTP: Fix and optimize byte formation (for bytes over 0x7F)

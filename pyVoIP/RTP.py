@@ -38,6 +38,7 @@ def byte_to_bits(byte: bytes) -> str:
         raise ValueError(f"byte_to_bits expects 1 byte, got {len(byte)}")
     return format(byte[0], "08b")
 
+
 def add_bytes(byte_string: bytes) -> int:
     return int.from_bytes(byte_string, "big", signed=False)
 

@@ -20,19 +20,50 @@ This basic code will simple make a phone that will automatically answer then han
 ```python
 from pyVoIP.VoIP import VoIPPhone, InvalidStateError
 
-def answer(call): # This will be your callback function for when you receive a phone call.
+
+def answer(call):  # This will be your callback function for when you receive a phone call.
     try:
-      call.answer()
-      call.hangup()
+        call.answer()
+        call.hangup()
     except InvalidStateError:
-      pass
-  
+        pass
+
+
 if __name__ == "__main__":
-    phone=VoIPPhone(<SIP Server IP>, <SIP Server Port>, <SIP Server Username>, <SIP Server Password>, callCallback=answer, myIP=<Your computer's local IP>, sipPort=<Port to use for SIP (int, default 5060)>, rtpPortLow=<low end of the RTP Port Range>, rtpPortHigh=<high end of the RTP Port Range>)
+    phone = VoIPPhone(
+        <SIP Server IP>,
+        <SIP Server Port>,
+        <SIP Server Username>,
+        <SIP Server Password>,
+        callCallback=answer,
+        myIP=<Your computer's local IP>,
+        sipPort=<Port to use for SIP (int, default 5060)>,
+        rtpPortLow=<low end of the RTP Port Range>,
+        rtpPortHigh=<high end of the RTP Port Range>,
+    )
     phone.start()
-    input('Press enter to disable the phone')
+    input("Press enter to disable the phone")
     phone.stop()
 ```
+
+### Using an outbound SIP proxy
+If your provider requires a separate outbound proxy, keep `server` pointed at the SIP domain / registrar and pass the proxy host separately.
+
+```python
+phone = VoIPPhone(
+    "sip.example.com",
+    5060,
+    "alice",
+    "secret",
+    myIP="192.0.2.10",
+    proxy="pbx.example.net",
+    proxyPort=5060,
+    auth_username="alice-auth-id",  # Optional: used for Proxy-Authorization
+    callCallback=answer,
+)
+```
+
+`proxy` may be a hostname, `host:port`, or a SIP URI such as `sip:pbx.example.net:5060`.
 
 ### Sponsors
 

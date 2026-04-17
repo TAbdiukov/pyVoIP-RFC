@@ -115,10 +115,11 @@ class VoIPCall:
                 return
 
             for i in request.body["m"]:
-                if i["type"] == "video":  # Disable Video
+                if i["type"] == "video":
                     continue
                 assoc = {}
                 e = False
+                pt = None
                 for x in i["methods"]:
                     try:
                         p = RTP.PayloadType(int(x))
@@ -170,7 +171,7 @@ class VoIPCall:
                 # TODO: If no codecs are compatible then send error to PBX.
 
                 port = self.phone.request_port()
-                self.assignedPorts[port] = codecs  # or assoc, anything truthy
+                self.assignedPorts[port] = codecs
                 self.create_rtp_clients(
                     codecs, self.myIP, port, request, i["port"]
                 )
@@ -345,10 +346,6 @@ class VoIPCall:
         return self.gen_ms()
 
     def gen_ms(self) -> Dict[int, Dict[int, RTP.PayloadType]]:
-        """
-        Generate m SDP attribute for answering originally and
-        for re-negotiations.
-        """
         # TODO: this seems "dangerous" if for some reason sip server handles 2
         # and more bindings it will cause duplicate RTP-Clients to spawn.
         m = {}
@@ -363,17 +360,15 @@ class VoIPCall:
         message = self.sip.gen_answer(
             request, self.session_id, m, self.sendmode
         )
-        self.sip.out.sendto(
-            message.encode("utf8"), (self.phone.server, self.phone.port)
-        )
+        self.sip.send_response(request, message)
         for i in request.body["m"]:
-            if i["type"] == "video":  # Disable Video
+            if i["type"] == "video":
                 continue
             for ii, client in zip(
                 range(len(request.body["c"])), self.RTPClients
             ):
                 client.outIP = request.body["c"][ii]["address"]
-                client.outPort = i["port"] + ii  # TODO: Check IPv4/IPv6
+                client.outPort = i["port"] + ii
 
     def answer(self) -> None:
         if self.state != CallState.RINGING:
@@ -388,9 +383,7 @@ class VoIPCall:
         message = self.sip.gen_answer(
             self.request, self.session_id, m, self.sendmode
         )
-        self.sip.out.sendto(
-            message.encode("utf8"), (self.phone.server, self.phone.port)
-        )
+        self.sip.send_response(self.request, message)
         self.state = CallState.ANSWERED
         debug(
             f"Call {self.call_id} answered",
@@ -409,9 +402,10 @@ class VoIPCall:
         )
 
         for i in request.body["m"]:
-            if i["type"] == "video":  # Disable Video
+            if i["type"] == "video":
                 continue
             assoc = {}
+            p = None
             for x in i["methods"]:
                 try:
                     p = RTP.PayloadType(int(x))
@@ -512,9 +506,7 @@ class VoIPCall:
         )
 
         message = self.sip.gen_busy(self.request)
-        self.sip.out.sendto(
-            message.encode("utf8"), (self.phone.server, self.phone.port)
-        )
+        self.sip.send_response(self.request, message)
         for x in self.RTPClients:
             x.stop()
         self.state = CallState.ENDED
@@ -599,6 +591,7 @@ class VoIPCall:
             mixed = audioop.add(mixed, frame, 1)
         return mixed
 
+
 class VoIPPhone:
     def __init__(
         self,
@@ -612,9 +605,15 @@ class VoIPPhone:
         rtpPortLow=10000,
         rtpPortHigh=20000,
         auth_username: Optional[str] = None,
+        proxy: Optional[str] = None,
+        proxyPort: Optional[int] = None,
+        proxy_port: Optional[int] = None,
     ):
         if rtpPortLow > rtpPortHigh:
             raise InvalidRangeError("'rtpPortHigh' must be >= 'rtpPortLow'")
+
+        if proxy_port is not None:
+            proxyPort = proxy_port
 
         self.rtpPortLow = rtpPortLow
         self.rtpPortHigh = rtpPortHigh
@@ -632,6 +631,8 @@ class VoIPPhone:
         self.auth_username = (
             username if auth_username is None else auth_username
         )
+        self.proxy = proxy
+        self.proxyPort = proxyPort
         self.callCallback = callCallback
         self._status = PhoneStatus.INACTIVE
 
@@ -654,6 +655,8 @@ class VoIPPhone:
             callCallback=self.callback,
             fatalCallback=self.fatal,
             auth_username=self.auth_username,
+            proxy=self.proxy,
+            proxy_port=self.proxyPort,
         )
 
     def _send_ack(self, request: SIP.SIPMessage) -> None:
@@ -662,9 +665,7 @@ class VoIPPhone:
         self.sip.out.sendto(ack.encode("utf8"), (host, port))
 
     def callback(self, request: SIP.SIPMessage) -> None:
-        # debug("Callback: "+request.summary())
         if request.type == pyVoIP.SIP.SIPMessageType.MESSAGE:
-            # debug("This is a message")
             if request.method == "INVITE":
                 self._callback_MSG_Invite(request)
             elif request.method == "BYE":
@@ -698,7 +699,10 @@ class VoIPPhone:
 
         if call_id in self.calls:
             call = self.calls[call_id]
-            if request.status in (SIP.SIPStatus.RINGING, SIP.SIPStatus.SESSION_PROGRESS):
+            if request.status in (
+                SIP.SIPStatus.RINGING,
+                SIP.SIPStatus.SESSION_PROGRESS,
+            ):
                 if call.state == CallState.DIALING:
                     call.state = CallState.RINGING
 
@@ -773,18 +777,15 @@ class VoIPPhone:
             # TODO: this seems "dangerous" if for some reason sip server
             # handles 2 and more bindings it will cause duplicate RTP-Clients
             # to spawn.
-
             # CallState.Ringing seems important here to prevent multiple
             # answering and RTP-Client spawning. Find out when renegotiation
             # is relevant.
             if self.calls[call_id].state != CallState.RINGING:
                 self.calls[call_id].renegotiate(request)
-            return  # Raise Error
+            return
         if self.callCallback is None:
             message = self.sip.gen_busy(request)
-            self.sip.out.sendto(
-                message.encode("utf8"), (self.server, self.port)
-            )
+            self.sip.send_response(request, message)
         else:
             debug("New call!")
             sess_id = None
@@ -794,9 +795,7 @@ class VoIPPhone:
                     self.session_ids.append(proposed)
                     sess_id = proposed
             message = self.sip.gen_ringing(request)
-            self.sip.out.sendto(
-                message.encode("utf8"), (self.server, self.port)
-            )
+            self.sip.send_response(request, message)
             self._create_Call(request, sess_id)
             try:
                 t = Timer(1, self.callCallback, [self.calls[call_id]])
@@ -807,9 +806,7 @@ class VoIPPhone:
                 self.threadLookup[t] = call_id
             except Exception:
                 message = self.sip.gen_busy(request)
-                self.sip.out.sendto(
-                    message.encode("utf8"), (self.server, self.port)
-                )
+                self.sip.send_response(request, message)
                 raise
 
     def _callback_MSG_Bye(self, request: SIP.SIPMessage) -> None:
@@ -841,8 +838,7 @@ class VoIPPhone:
         # issue here or your invite is wrong.
         self.calls[call_id].answered(request)
         debug("Answered")
-        ack = self.sip.gen_ack(request)
-        self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        self._send_ack(request)
 
     def _callback_RESP_NotFound(self, request: SIP.SIPMessage) -> None:
         debug("Not Found recieved, invalid number called?")
@@ -863,8 +859,7 @@ class VoIPPhone:
 
         self.calls[call_id].not_found(request)
         debug("Terminating Call")
-        ack = self.sip.gen_ack(request)
-        self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        self._send_ack(request)
 
     def _callback_RESP_Unavailable(self, request: SIP.SIPMessage) -> None:
         debug("Service Unavailable recieved")
@@ -884,14 +879,9 @@ class VoIPPhone:
             return
         self.calls[call_id].unavailable(request)
         debug("Terminating Call")
-        ack = self.sip.gen_ack(request)
-        self.sip.out.sendto(ack.encode("utf8"), (self.server, self.port))
+        self._send_ack(request)
 
     def _create_Call(self, request: SIP.SIPMessage, sess_id: int) -> None:
-        """
-        Create VoIP call object. Should be separated to enable better
-        subclassing.
-        """
         call_id = request.headers["Call-ID"]
         self.calls[call_id] = VoIPCall(
             self,
@@ -965,18 +955,6 @@ class VoIPPhone:
 
         return call
 
-        self.calls[call_id] = VoIPCall(
-            self,
-            CallState.DIALING,
-            request,
-            sess_id,
-            self.myIP,
-            ms=medias,
-            sendmode=self.sendmode,
-        )
-
-        return self.calls[call_id]
-
     def request_port(self, blocking=True) -> int:
         ports_available = [
             port
@@ -1026,7 +1004,8 @@ class VoIPPhone:
                         ports.append(port)
 
             for port in ports:
-                self.assignedPorts.remove(port)
+                if port in self.assignedPorts:
+                    self.assignedPorts.remove(port)
 
     def _cleanup_dead_calls(self) -> None:
         to_delete = []
