@@ -1,6 +1,6 @@
 from enum import Enum
 from threading import Timer
-from typing import Callable, Deque, Dict, Optional, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Union
 from collections import deque
 import audioop
 import io
@@ -17,6 +17,9 @@ __all__ = [
     "add_bytes",
     "byte_to_bits",
     "DynamicPayloadType",
+    "codec_info",
+    "payload_type_from_name",
+    "supported_codecs",
     "PayloadType",
     "RTPParseError",
     "RTPProtocol",
@@ -154,6 +157,72 @@ class PayloadType(Enum):
     # Non-codec
     EVENT = "telephone-event", 8000, 0, "telephone-event"
     UNKNOWN = "UNKNOWN", 0, 0, "UNKNOWN CODEC"
+
+
+def payload_type_from_name(name: str) -> PayloadType:
+    """Return a :class:`PayloadType` matching an SDP codec name.
+
+    SDP ``rtpmap`` lines identify dynamic payloads by encoding names such as
+    ``telephone-event`` or ``opus``.  Static payloads are often represented by
+    their payload number, but some peers still include an ``rtpmap`` name like
+    ``PCMU``.  This helper resolves the names known by PyVoIP without relying
+    on hard-coded codec lists outside this module.
+    """
+    needle = str(name or "").strip().lower()
+    if not needle:
+        raise ValueError("Codec name cannot be empty.")
+
+    for codec in PayloadType:
+        names = {str(codec).lower(), codec.description.lower()}
+        if isinstance(codec.value, str):
+            names.add(codec.value.lower())
+        if needle in names:
+            return codec
+
+    raise ValueError(f"RTP Payload type {name!r} not found.")
+
+
+def codec_info(
+    codec: PayloadType,
+    payload_type: Optional[int] = None,
+    *,
+    media_type: Optional[str] = None,
+    fmtp: Optional[List[str]] = None,
+    source: str = "pyvoip",
+    supported: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Return a serializable description of an RTP codec."""
+    if payload_type is None:
+        try:
+            payload_type = int(codec)
+        except DynamicPayloadType:
+            payload_type = None
+
+    if supported is None:
+        supported = codec in getattr(pyVoIP, "RTPCompatibleCodecs", [])
+
+    return {
+        "media_type": media_type,
+        "payload_type": payload_type,
+        "name": str(codec),
+        "description": codec.description,
+        "rate": codec.rate,
+        "channels": codec.channel,
+        "is_dynamic": not isinstance(codec.value, int),
+        "fmtp": list(fmtp or []),
+        "codec_supported": bool(supported),
+        "protocol_supported": None,
+        "supported": bool(supported),
+        "source": source,
+    }
+
+
+def supported_codecs() -> List[Dict[str, Any]]:
+    """Return codecs supported by this PyVoIP build/configuration."""
+    return [
+        codec_info(codec)
+        for codec in getattr(pyVoIP, "RTPCompatibleCodecs", [])
+    ]
 
 
 class RTPPacketManager:

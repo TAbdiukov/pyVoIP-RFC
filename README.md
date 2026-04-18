@@ -65,6 +65,31 @@ phone = VoIPPhone(
 
 `proxy` may be a hostname, `host:port`, or a SIP URI such as `sip:pbx.example.net:5060`.
 
+### Inspecting supported codecs
+Parsed SIP/SDP messages and active calls can report the codecs offered by the
+remote endpoint and the codecs supported by PyVoIP.
+
+```python
+import pyVoIP
+
+
+def answer(call):
+    report = call.codec_support_report()
+
+    print("Remote codecs:", report["remote"])
+    print("PyVoIP codecs:", report["pyvoip"])
+    print("Compatible codecs:", report["compatible"])
+    print("Unsupported remote codecs:", report["unsupported"])
+
+
+# Also available for any parsed SIPMessage containing SDP:
+remote_codecs = sip_message.supported_codecs()
+report = sip_message.codec_support_report()
+
+# And at module level:
+pyvoip_codecs = pyVoIP.supported_codecs()
+```
+
 ### Sponsors
 
 - [Nabu Casa](https://www.nabucasa.com/)

@@ -1,4 +1,9 @@
-__all__ = ["SIP", "RTP", "VoIP"]
+__all__ = [
+    "SIP", "RTP", "VoIP",
+    "codec_support_report",
+    "sip_supported_codecs",
+    "supported_codecs",
+]
 
 from datetime import datetime, timezone
 
@@ -44,3 +49,24 @@ SIPCompatibleVersions = ["SIP/2.0"]
 
 RTPCompatibleVersions = [2]
 RTPCompatibleCodecs = [PayloadType.PCMU, PayloadType.PCMA, PayloadType.EVENT]
+
+
+def supported_codecs():
+    """Return codecs supported by this PyVoIP build/configuration."""
+    from pyVoIP.RTP import supported_codecs as _supported_codecs
+
+    return _supported_codecs()
+
+
+def sip_supported_codecs(message, media_type="audio"):
+    """Return codecs advertised by a parsed SIP message's SDP body."""
+    from pyVoIP.SIP import sip_supported_codecs as _sip_supported_codecs
+
+    return _sip_supported_codecs(message, media_type=media_type)
+
+
+def codec_support_report(message, media_type="audio"):
+    """Compare a SIP message's SDP codecs against PyVoIP support."""
+    from pyVoIP.SIP import codec_support_report as _codec_support_report
+
+    return _codec_support_report(message, media_type=media_type)

@@ -3,6 +3,7 @@
 
 ## 2.7.5+RFC
 
+- API: Add codec introspection helpers for remote SIP SDP offers and PyVoIP RTP compatibility.
 - VoIP: Handle final INVITE failure received while call is not dialing
 - RTP: IPv4/IPv6 address-family validation during VoIP renegotiation.
 - RTP: avoid duplicate RTP clients / duplicate local RTP socket binds during SDP RTP setup.
@@ -18,7 +19,7 @@
 - SIP: Fix unbounded retry/recursion in SIP deregistration
 - VoIP: Improve "no compatible codecs" codec-negotiation 
 - pyVOIP: Overall improve IPv4/IPv6 RTP address-family handling
-- SIP: Do Check IPv4/IPv6
+- SIP: Do check IPv4/IPv6
 - SIP&VoIP: If no codecs are compatible then send error to PBX
 - SIP: Fix unsupported SIP request handling
 - SIP: Fix missing dialog / transaction around inbound BYE and CANCEL.

@@ -58,6 +58,9 @@ class VoIPCall:
         self.sip = self.phone.sip
         self.request = request
         self.call_id = request.headers["Call-ID"]
+        self.remote_sip_message = (
+            request if callstate == CallState.RINGING else None
+        )
         self.session_id = str(session_id)
         self.myIP = myIP
         self.rtpPortHigh = self.phone.rtpPortHigh
@@ -363,6 +366,27 @@ class VoIPCall:
     def send_dtmf_sequence(self, digits: str) -> bool:
         return self.send_dtmf(digits)
 
+    def remote_supported_codecs(self) -> List[Dict[str, Any]]:
+        """Return codecs advertised by the remote endpoint's SDP."""
+        if self.remote_sip_message is None:
+            return []
+        return self.remote_sip_message.supported_codecs()
+
+    def codec_support_report(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Compare the remote SDP codecs against PyVoIP support."""
+        if self.remote_sip_message is None:
+            pyvoip_codecs = RTP.supported_codecs()
+            return {
+                "remote": [],
+                "pyvoip": pyvoip_codecs,
+                "compatible": [],
+                "unsupported": [],
+                "good": [],
+                "missing": [],
+                "pyvoip_missing_from_remote": pyvoip_codecs,
+            }
+        return self.remote_sip_message.codec_support_report()
+
     def _finalize_ended_call(self) -> None:
         try:
             self.phone.release_ports(call=self)
@@ -449,6 +473,7 @@ class VoIPCall:
             + f"call_id={self.call_id} contact={request.headers.get('Contact')}",
         )
 
+        self.remote_sip_message = request
         for i in request.body["m"]:
             if i["type"] == "video":
                 continue
@@ -807,6 +832,9 @@ class VoIPPhone:
 
     def get_status(self) -> PhoneStatus:
         return self._status
+
+    def supported_codecs(self) -> List[Dict[str, Any]]:
+        return RTP.supported_codecs()
 
  
     def _has_assignable_audio_ports(self, request: SIP.SIPMessage) -> bool:
