@@ -978,10 +978,7 @@ class VoIPPhone:
 
         if call_id not in self.calls:
             debug("Unknown/No call")
-            debug(
-                "TODO: Add 481 here as server is probably waiting for "
-                + "an ACK"
-            )
+            debug("ACKing unmatched final INVITE response")
             self._send_ack(request)
             return
 
@@ -999,10 +996,7 @@ class VoIPPhone:
 
         if call_id not in self.calls:
             debug("Unkown call")
-            debug(
-                "TODO: Add 481 here as server is probably waiting for "
-                + "an ACK"
-            )
+            debug("ACKing unmatched final INVITE response")
             self._send_ack(request)
             return
         self.calls[call_id].unavailable(request)

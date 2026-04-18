@@ -2653,7 +2653,10 @@ class SIPClient:
         return self.gen_ack(request)
 
     def gen_ack(self, request: SIPMessage) -> str:
-        tag = self.tagLibrary[request.headers["Call-ID"]]
+        call_id = request.headers["Call-ID"]
+        tag = self.tagLibrary.get(call_id)
+        if tag is None:
+            tag = request.headers["From"].get("tag", "")
 
         is_2xx = (
             request.type == SIPMessageType.RESPONSE
@@ -2679,7 +2682,10 @@ class SIPClient:
             to_line += f";tag={request.headers['To']['tag']}"
         ackMessage += f"To: {to_line}\r\n"
 
-        ackMessage += f"From: {request.headers['From']['raw']};tag={tag}\r\n"
+        ackMessage += f"From: {request.headers['From']['raw']}"
+        if tag:
+            ackMessage += f";tag={tag}"
+        ackMessage += "\r\n"
         ackMessage += f"Call-ID: {request.headers['Call-ID']}\r\n"
         ackMessage += f"CSeq: {request.headers['CSeq']['check']} ACK\r\n"
         ackMessage += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"

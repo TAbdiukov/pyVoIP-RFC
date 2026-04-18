@@ -3,6 +3,7 @@
 
 ## 2.7.4+RFC
 
+- SIP: ACK unmatched final INVITE responses after local call state is gone.
 - SIP: Fix unbounded retry/recursion in SIP deregistration
 - VoIP: Improve "no compatible codecs" codec-negotiation 
 - pyVOIP: Overall improve IPv4/IPv6 RTP address-family handling
