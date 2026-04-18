@@ -3,6 +3,9 @@
 
 ## 2.7.4+RFC
 
+- VoIP: invalid RTP/media port layouts ought to fail cleanly
+- SIP: BYE dialog routing / connected-client handling
+- SIP: Implement REGISTER/DEREGISTER 400 Bad Request handling
 - SIP: Implement and wire "Supported" header support
 - RTP: safe lock handling in RTPPacketManager.write()
 - VoIP: Ignore unsupported RTP/SAVP offers and reject invalid RTP audio port layouts before ringing.

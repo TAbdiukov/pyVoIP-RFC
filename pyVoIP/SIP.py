@@ -28,6 +28,7 @@ __all__ = [
     "SIPMessage",
     "SIPMessageType",
     "SIPParseError",
+    "SIPRequestError",
     "SIPSubscription",
     "SIPStatus",
 ]
@@ -41,6 +42,10 @@ class InvalidAccountInfoError(Exception):
 
 
 class SIPParseError(Exception):
+    pass
+
+
+class SIPRequestError(Exception):
     pass
 
 
@@ -1052,13 +1057,22 @@ class SIPClient:
     def dialog_target(self, request: SIPMessage) -> Tuple[str, int]:
         if self.proxy is not None:
             return self.signal_target()
+        remote_uri = self._dialog_remote_uri(request)
+        if remote_uri:
+            return self._sip_target_from_uri(remote_uri, self.port)
+        return self.signal_target()
+
+    def _dialog_remote_uri(self, request: SIPMessage) -> str:
         contact = request.headers.get("Contact")
         if contact:
-            return self._sip_target_from_uri(
-                self._extract_uri(str(contact)),
-                self.port,
-            )
-        return self.signal_target()
+            return self._extract_uri(str(contact))
+
+        call_id = request.headers["Call-ID"]
+        tag = self.tagLibrary.get(call_id, "")
+        if request.headers["From"]["tag"] == tag:
+            return self._extract_uri(str(request.headers["To"]["raw"]))
+        return self._extract_uri(str(request.headers["From"]["raw"]))
+
 
     @staticmethod
     def _format_sip_uri(
@@ -2619,9 +2633,12 @@ class SIPClient:
 
     def gen_bye(self, request: SIPMessage) -> str:
         tag = self.tagLibrary[request.headers["Call-ID"]]
-        c = self._extract_uri(str(request.headers.get("Contact", request.headers["To"]["raw"])))
+        c = self._dialog_remote_uri(request)
         byeRequest = f"BYE {c} SIP/2.0\r\n"
-        byeRequest += self._gen_response_via_header(request)
+        byeRequest += (
+            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
+            + f"branch={self.gen_branch()};rport\r\n"
+        )
         fromH = request.headers["From"]["raw"]
         toH = request.headers["To"]["raw"]
         if request.headers["From"]["tag"] == tag:
@@ -2976,7 +2993,6 @@ class SIPClient:
 
     def bye(self, request: SIPMessage) -> None:
         message = self.gen_bye(request)
-        # TODO: Handle bye to server vs. bye to connected client
         self.out.sendto(
             message.encode("utf8"),
             self.dialog_target(request),
@@ -3026,6 +3042,9 @@ class SIPClient:
         response = SIPMessage(resp)
         response = self.trying_timeout_check(response)
 
+        if response.status == SIPStatus.BAD_REQUEST:
+            self._handle_bad_request("DEREGISTER", response)
+
         if response.status in (
             SIPStatus.UNAUTHORIZED,
             SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
@@ -3050,12 +3069,8 @@ class SIPClient:
                         "Invalid authentication credentials for SIP server "
                         + f"{self.server}:{self.myPort}"
                     )
-                elif response.status == SIPStatus(400):
-                    # Bad Request
-                    # TODO: implement
-                    # TODO: check if broken connection can be brought back
-                    # with new urn:uuid or reply with expire 0
-                    self._handle_bad_request()
+                elif response.status == SIPStatus.BAD_REQUEST:
+                    self._handle_bad_request("DEREGISTER", response)
             else:
                 raise TimeoutError("Deregistering on SIP Server timed out")
 
@@ -3129,12 +3144,8 @@ class SIPClient:
         response = self.trying_timeout_check(response)
         first_response = response
 
-        if response.status == SIPStatus(400):
-            # Bad Request
-            # TODO: implement
-            # TODO: check if broken connection can be brought back
-            # with new urn:uuid or reply with expire 0
-            self._handle_bad_request()
+        if response.status == SIPStatus.BAD_REQUEST:
+            self._handle_bad_request("REGISTER", response)
 
         if response.status in (
             SIPStatus.UNAUTHORIZED,
@@ -3171,12 +3182,8 @@ class SIPClient:
                         "Invalid authentication credentials for SIP server "
                         + f"{self.server}:{self.myPort}"
                     )
-                elif response.status == SIPStatus(400):
-                    # Bad Request
-                    # TODO: implement
-                    # TODO: check if broken connection can be brought back
-                    # with new urn:uuid or reply with expire 0
-                    self._handle_bad_request()
+                elif response.status == SIPStatus.BAD_REQUEST:
+                    self._handle_bad_request("REGISTER", response)
             else:
                 raise TimeoutError("Registering on SIP Server timed out")
 
@@ -3205,12 +3212,31 @@ class SIPClient:
                 + f"{self.server}:{self.myPort}"
             )
 
-    def _handle_bad_request(self) -> None:
-        # Bad Request
-        # TODO: implement
-        # TODO: check if broken connection can be brought back
-        # with new urn:uuid or reply with expire 0
-        debug("Bad Request")
+    def _handle_bad_request(
+        self,
+        action: str,
+        response: SIPMessage,
+    ) -> None:
+        message = f"SIP {action} failed with 400 Bad Request"
+        details = []
+        call_id = response.headers.get("Call-ID")
+        cseq = response.headers.get("CSeq")
+        if isinstance(cseq, dict):
+            cseq_value = (
+                f"{cseq.get('check', '')} {cseq.get('method', '')}"
+            ).strip()
+        else:
+            cseq_value = str(cseq or "")
+
+        if call_id:
+            details.append(f"Call-ID={call_id}")
+        if cseq_value:
+            details.append(f"CSeq={cseq_value}")
+        if details:
+            message += " (" + ", ".join(details) + ")"
+
+        debug(message)
+        raise SIPRequestError(message)
 
     def subscribe(self, lastresponse: SIPMessage) -> None:
         warnings.warn(

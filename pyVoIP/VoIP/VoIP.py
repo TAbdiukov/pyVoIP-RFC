@@ -113,8 +113,7 @@ class VoIPCall:
                 (audioPortsAdj == self.connections or self.audioPorts == 0)
                 and (videoPortsAdj == self.connections or self.videoPorts == 0)
             ):
-                # TODO: Throw error to PBX in this case
-                warnings.warn("Unable to assign ports for RTP.", stacklevel=2)
+                raise RTP.RTPParseError("Unable to assign ports for RTP.")
                 return
 
             for i in request.body["m"]:
