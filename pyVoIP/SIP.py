@@ -1286,6 +1286,85 @@ class SIPClient:
         )
 
     @staticmethod
+    def _request_header_value(request: str, header: str) -> str:
+        prefix = header.lower() + ":"
+        for line in request.split("\r\n"):
+            if line.lower().startswith(prefix):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    @classmethod
+    def _request_transaction(cls, request: str) -> Tuple[str, str, str]:
+        cseq = cls._request_header_value(request, "CSeq")
+        cseq_parts = cseq.split()
+        cseq_check = cseq_parts[0] if cseq_parts else ""
+        cseq_method = cseq_parts[1] if len(cseq_parts) > 1 else ""
+        return (
+            cls._request_header_value(request, "Call-ID"),
+            cseq_check,
+            cseq_method,
+        )
+
+    def _send_register_request(
+        self,
+        request: str,
+        *,
+        action: str,
+    ) -> SIPMessage:
+        self.out.setblocking(False)
+        self.out.sendto(request.encode("utf8"), self.signal_target())
+        return self._wait_for_transaction_response(request, action=action)
+
+    def _wait_for_transaction_response(
+        self,
+        request: str,
+        *,
+        action: str,
+    ) -> SIPMessage:
+        call_id, cseq_check, cseq_method = self._request_transaction(request)
+        deadline = time.monotonic() + self.register_timeout
+        last_provisional: Optional[SIPMessage] = None
+
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            ready = select.select([self.s], [], [], remaining)
+            if not ready[0]:
+                break
+
+            response = SIPMessage(self.s.recv(8192))
+            if response.type == SIPMessageType.MESSAGE:
+                self.parse_message(response)
+                continue
+
+            cseq = response.headers.get("CSeq", {})
+            if not isinstance(cseq, dict):
+                self.parse_message(response)
+                continue
+
+            if (
+                response.headers.get("Call-ID") != call_id
+                or cseq.get("check") != cseq_check
+                or cseq.get("method") != cseq_method
+            ):
+                self.parse_message(response)
+                continue
+
+            if 100 <= int(response.status) < 200:
+                last_provisional = response
+                continue
+
+            return response
+
+        if last_provisional is not None:
+            raise TimeoutError(
+                f"Waited {self.register_timeout} seconds but server only "
+                + "sent provisional SIP "
+                + f"{int(last_provisional.status)} "
+                + f"{last_provisional.status.phrase}"
+            )
+        raise TimeoutError(f"{action} on SIP Server timed out")
+
+    @staticmethod
     def _gen_supported_header() -> str:
         return "Supported:\r\n"
 
@@ -3040,18 +3119,9 @@ class SIPClient:
     def __deregister(self) -> bool:
         self.phone._status = PhoneStatus.DEREGISTERING
         firstRequest = self.gen_first_response(deregister=True)
-        self.out.sendto(firstRequest.encode("utf8"), self.signal_target())
-
-        self.out.setblocking(False)
-
-        ready = select.select([self.out], [], [], self.register_timeout)
-        if ready[0]:
-            resp = self.s.recv(8192)
-        else:
-            raise TimeoutError("Deregistering on SIP Server timed out")
-
-        response = SIPMessage(resp)
-        response = self.trying_timeout_check(response)
+        response = self._send_register_request(
+            firstRequest, action="Deregistering"
+        )
 
         if response.status == SIPStatus.BAD_REQUEST:
             self._handle_bad_request("DEREGISTER", response)
@@ -3062,28 +3132,22 @@ class SIPClient:
         ):
             # 401 Unauthorized or 407 Proxy Authentication Required.
             regRequest = self.gen_register(response, deregister=True)
-            self.out.sendto(
-                regRequest.encode("utf8"), self.signal_target()
+            response = self._send_register_request(
+                regRequest, action="Deregistering"
             )
-            ready = select.select([self.s], [], [], self.register_timeout)
-            if ready[0]:
-                resp = self.s.recv(8192)
-                response = SIPMessage(resp)
-                if response.status in (
-                    SIPStatus.UNAUTHORIZED,
-                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
-                ):
-                    # At this point, it's reasonable to assume that
-                    # this is caused by invalid credentials.
-                    debug("Unauthorized")
-                    raise InvalidAccountInfoError(
-                        "Invalid authentication credentials for SIP server "
-                        + f"{self.server}:{self.myPort}"
-                    )
-                elif response.status == SIPStatus.BAD_REQUEST:
-                    self._handle_bad_request("DEREGISTER", response)
-            else:
-                raise TimeoutError("Deregistering on SIP Server timed out")
+            if response.status in (
+                SIPStatus.UNAUTHORIZED,
+                SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+            ):
+                # At this point, it's reasonable to assume that
+                # this is caused by invalid credentials.
+                debug("Unauthorized")
+                raise InvalidAccountInfoError(
+                    "Invalid authentication credentials for SIP server "
+                    + f"{self.server}:{self.myPort}"
+                )
+            elif response.status == SIPStatus.BAD_REQUEST:
+                self._handle_bad_request("DEREGISTER", response)
 
         if response.status == SIPStatus(500):
             # We raise so the calling function can sleep and try again
@@ -3141,18 +3205,9 @@ class SIPClient:
     def __register(self) -> bool:
         self.phone._status = PhoneStatus.REGISTERING
         firstRequest = self.gen_first_response()
-        self.out.sendto(firstRequest.encode("utf8"), self.signal_target())
-
-        self.out.setblocking(False)
-
-        ready = select.select([self.out], [], [], self.register_timeout)
-        if ready[0]:
-            resp = self.s.recv(8192)
-        else:
-            raise TimeoutError("Registering on SIP Server timed out")
-
-        response = SIPMessage(resp)
-        response = self.trying_timeout_check(response)
+        response = self._send_register_request(
+            firstRequest, action="Registering"
+        )
         first_response = response
 
         if response.status == SIPStatus.BAD_REQUEST:
@@ -3164,41 +3219,33 @@ class SIPClient:
         ):
             # 401 Unauthorized or 407 Proxy Authentication Required.
             regRequest = self.gen_register(response)
-            self.out.sendto(
-                regRequest.encode("utf8"), self.signal_target()
+            response = self._send_register_request(
+                regRequest, action="Registering"
             )
-            ready = select.select([self.s], [], [], self.register_timeout)
-            if ready[0]:
-                resp = self.s.recv(8192)
-                response = SIPMessage(resp)
-                response = self.trying_timeout_check(response)
-                if response.status in (
-                    SIPStatus.UNAUTHORIZED,
-                    SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
-                ):
-                    # At this point, it's reasonable to assume that
-                    # this is caused by invalid credentials.
-                    debug("=" * 50)
-                    debug("Unauthorized, SIP Message Log:\n")
-                    debug("SENT")
-                    debug(firstRequest)
-                    debug("\nRECEIVED")
-                    debug(first_response.summary())
-                    debug("\nSENT (DO NOT SHARE THIS PACKET)")
-                    debug(regRequest)
-                    debug("\nRECEIVED")
-                    debug(response.summary())
-                    debug("=" * 50)
-                    raise InvalidAccountInfoError(
-                        "Invalid authentication credentials for SIP server "
-                        + f"{self.server}:{self.myPort}"
-                    )
-                elif response.status == SIPStatus.BAD_REQUEST:
-                    self._handle_bad_request("REGISTER", response)
-            else:
-                raise TimeoutError("Registering on SIP Server timed out")
+            if response.status in (
+                SIPStatus.UNAUTHORIZED,
+                SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
+            ):
+                # At this point, it's reasonable to assume that
+                # this is caused by invalid credentials.
+                debug("=" * 50)
+                debug("Unauthorized, SIP Message Log:\n")
+                debug("SENT")
+                debug(firstRequest)
+                debug("\nRECEIVED")
+                debug(first_response.summary())
+                debug("\nSENT (DO NOT SHARE THIS PACKET)")
+                debug(regRequest)
+                debug("\nRECEIVED")
+                debug(response.summary())
+                debug("=" * 50)
+                raise InvalidAccountInfoError(
+                    "Invalid authentication credentials for SIP server "
+                    + f"{self.server}:{self.myPort}"
+                )
+            elif response.status == SIPStatus.BAD_REQUEST:
+                self._handle_bad_request("REGISTER", response)
 
-        # TODO: This must be done more reliably
         if response.status not in [
             SIPStatus(400),
             SIPStatus(401),
@@ -3275,14 +3322,21 @@ class SIPClient:
         """
         start_time = time.monotonic()
         while response.status == SIPStatus.TRYING:
-            if (time.monotonic() - start_time) >= self.register_timeout:
+            remaining = self.register_timeout - (
+                time.monotonic() - start_time
+            )
+            if remaining <= 0:
                 raise TimeoutError(
                     f"Waited {self.register_timeout} seconds but server is "
                     + "still TRYING"
                 )
 
-            ready = select.select([self.s], [], [], self.register_timeout)
-            if ready[0]:
-                resp = self.s.recv(8192)
+            ready = select.select([self.s], [], [], remaining)
+            if not ready[0]:
+                raise TimeoutError(
+                    f"Waited {self.register_timeout} seconds but server is "
+                    + "still TRYING"
+                )
+            resp = self.s.recv(8192)
             response = SIPMessage(resp)
         return response
