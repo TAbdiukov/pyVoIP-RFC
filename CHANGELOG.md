@@ -3,7 +3,7 @@
 
 ## 2.7.5+RFC
 
-- Unittests
+- Unit tests
 - Regression rollback: multiline def .. string descriptions
 - SIP: Improve SIP registration response reliability
 - VoIP: Safer renegotiation for service recovery
