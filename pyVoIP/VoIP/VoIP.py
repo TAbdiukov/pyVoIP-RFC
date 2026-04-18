@@ -394,6 +394,13 @@ class VoIPCall:
         return m
 
     def renegotiate(self, request: SIP.SIPMessage) -> None:
+        if not self.phone._has_compatible_rtp_address_family(request):
+            message = self.sip.gen_response(
+                request, SIP.SIPStatus.NOT_ACCEPTABLE_HERE
+            )
+            self.sip.send_response(request, message)
+            return
+
         m = {}
         for x in self.RTPClients:
             m[x.inPort] = x.assoc
@@ -409,7 +416,6 @@ class VoIPCall:
                 range(len(request.body["c"])), self.RTPClients
             ):
                 client.outIP = request.body["c"][ii]["address"]
-                 # TODO: Check IPv4/IPv6
                 client.outPort = i["port"] + ii
 
     def answer(self) -> None:
