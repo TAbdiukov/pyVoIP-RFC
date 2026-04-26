@@ -1373,6 +1373,23 @@ class SIPClient:
         target = target.split("?", 1)[0]
         if ";" in target:
             target = target.split(";", 1)[0]
+
+        if target.startswith("["):
+            host, separator, rest = target[1:].partition("]")
+            if separator:
+                if rest.startswith(":"):
+                    try:
+                        return host, int(rest[1:])
+                    except ValueError:
+                        pass
+                return host, default_port
+
+        try:
+            ipaddress.ip_address(target)
+            return target, default_port
+        except ValueError:
+            pass
+
         if ":" in target:
             host, port = target.rsplit(":", 1)
             try:
@@ -1426,25 +1443,70 @@ class SIPClient:
             return self._extract_uri(str(request.headers["To"]["raw"]))
         return self._extract_uri(str(request.headers["From"]["raw"]))
 
-
     @staticmethod
+    def _format_hostport(
+        host: str,
+        port: Optional[int] = None,
+        *,
+        always_include_port: bool = False,
+    ) -> str:
+        formatted_host = str(host).strip()
+
+        # SIP URI hostports require IPv6 literals to be enclosed in brackets,
+        # otherwise the colons in the address are ambiguous with the port
+        # separator.
+        if ":" in formatted_host and not (
+            formatted_host.startswith("[") and formatted_host.endswith("]")
+        ):
+            formatted_host = f"[{formatted_host}]"
+
+        if port is not None and (always_include_port or int(port) != 5060):
+            return f"{formatted_host}:{int(port)}"
+        return formatted_host
+
+    @classmethod
     def _format_sip_uri(
+        cls,
         host: str,
         port: Optional[int] = None,
         *,
         user: Optional[str] = None,
         transport: Optional[str] = None,
+        always_include_port: bool = False,
     ) -> str:
         uri = "sip:"
         if user:
             uri += f"{user}@"
-        uri += host
-        if port is not None and port != 5060:
-            uri += f":{port}"
+        uri += cls._format_hostport(
+            host,
+            port,
+            always_include_port=always_include_port,
+        )
         if transport:
             uri += f";transport={transport}"
         return uri
 
+    def _contact_uri(self, *, user: Optional[str] = None) -> str:
+        """Return this UA's SIP Contact URI.
+
+        pyVoIP currently listens for SIP signaling over UDP only.  The SIP URI
+        transport parameter is therefore advertised explicitly so registrars,
+        notifiers, and dialog peers route subsequent requests back over the
+        transport pyVoIP can actually receive.
+        """
+        return self._format_sip_uri(
+            self.myIP,
+            self.myPort,
+            user=user or self.username,
+            transport="UDP",
+            always_include_port=True,
+        )
+
+    def _contact_header(self, *, include_instance: bool = False) -> str:
+        header = f"Contact: <{self._contact_uri()}>"
+        if include_instance:
+            header += f';+sip.instance="<urn:uuid:{self.urnUUID}>"'
+        return header + "\r\n"
 
     @staticmethod
     def _sdp_address_type(address: str) -> str:
@@ -1607,11 +1669,7 @@ class SIPClient:
             + f"branch={self.gen_branch()};rport\r\n"
         )
         request += "Max-Forwards: 70\r\n"
-        request += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort};"
-            + "transport=UDP>\r\n"
-        )
+        request += self._contact_header()
         request += f"To: {self._subscription_to_header(subscription)}\r\n"
         request += (
             f"From: <{self._registrar_uri(user=self.username)}>;"
@@ -2659,12 +2717,7 @@ class SIPClient:
         )
         regRequest += f"Call-ID: {self.gen_call_id()}\r\n"
         regRequest += f"CSeq: {self.registerCounter.next()} REGISTER\r\n"
-        regRequest += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort};"
-            + "transport=UDP>;+sip.instance="
-            + f'"<urn:uuid:{self.urnUUID}>"\r\n'
-        )
+        regRequest += self._contact_header(include_instance=True)
         regRequest += f'Allow: {(", ".join(pyVoIP.SIPCompatibleMethods))}\r\n'
         regRequest += "Max-Forwards: 70\r\n"
         regRequest += "Allow-Events: org.3gpp.nwinitdereg\r\n"
@@ -2704,13 +2757,7 @@ class SIPClient:
         subRequest += f"To: <{self._registrar_uri(user=self.username)}>\r\n"
         subRequest += f'Call-ID: {response.headers["Call-ID"]}\r\n'
         subRequest += f"CSeq: {self.subscribeCounter.next()} SUBSCRIBE\r\n"
-        # TODO: check if transport is needed
-        subRequest += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort};"
-            + "transport=UDP>;+sip.instance="
-            + f'"<urn:uuid:{self.urnUUID}>"\r\n'
-        )
+        subRequest += self._contact_header(include_instance=True)
         subRequest += "Max-Forwards: 70\r\n"
         subRequest += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
         subRequest += f"Expires: {self.default_expires * 2}\r\n"
@@ -2763,12 +2810,7 @@ class SIPClient:
         call_id = request.headers.get("Call-ID", self.gen_call_id())
         regRequest += f"Call-ID: {call_id}\r\n"
         regRequest += f"CSeq: {self.registerCounter.next()} REGISTER\r\n"
-        regRequest += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort};"
-            + "transport=UDP>;+sip.instance="
-            + f'"<urn:uuid:{self.urnUUID}>"\r\n'
-        )
+        regRequest += self._contact_header(include_instance=True)
         regRequest += f'Allow: {(", ".join(pyVoIP.SIPCompatibleMethods))}\r\n'
         regRequest += "Max-Forwards: 70\r\n"
         regRequest += "Allow-Events: org.3gpp.nwinitdereg\r\n"
@@ -2874,7 +2916,7 @@ class SIPClient:
             f"CSeq: {request.headers['CSeq']['check']} "
             + f"{request.headers['CSeq']['method']}\r\n"
         )
-        regRequest += f"Contact: {request.headers['Contact']}\r\n"
+        regRequest += self._contact_header()
         regRequest += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
         regRequest += self._gen_supported_header()
         regRequest += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
@@ -2945,10 +2987,7 @@ class SIPClient:
             f"CSeq: {request.headers['CSeq']['check']} "
             + f"{request.headers['CSeq']['method']}\r\n"
         )
-        regRequest += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort}>\r\n"
-        )
+        regRequest += self._contact_header()
         regRequest += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
         regRequest += self._gen_supported_header()
         regRequest += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
@@ -3019,10 +3058,7 @@ class SIPClient:
             + f"{branch}\r\n"
         )
         invRequest += "Max-Forwards: 70\r\n"
-        invRequest += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort}>\r\n"
-        )
+        invRequest += self._contact_header()
         invRequest += f"To: <{remote_uri}>\r\n"
         invRequest += f"From: <sip:{self.username}@{self.myIP}>;tag={tag}\r\n"
         invRequest += f"Call-ID: {call_id}\r\n"
@@ -3100,10 +3136,7 @@ class SIPClient:
         cseq = int(request.headers["CSeq"]["check"]) + 1
         byeRequest += f"CSeq: {cseq} BYE\r\n"
         byeRequest += "Max-Forwards: 70\r\n"
-        byeRequest += (
-            "Contact: "
-            + f"<sip:{self.username}@{self.myIP}:{self.myPort}>\r\n"
-        )
+        byeRequest += self._contact_header()
         byeRequest += f"User-Agent: pyVoIP {pyVoIP.__version__}\r\n"
         byeRequest += f"Allow: {(', '.join(pyVoIP.SIPCompatibleMethods))}\r\n"
         byeRequest += "Content-Length: 0\r\n\r\n"

@@ -2,6 +2,7 @@
 
 ## 2.7.6+RFC
 
+- SIP: Consolidate Contact header generation and explicitly advertise transport across SIP requests (fixing inconsistent URI handling).
 - RTP: Fix codec negotiation to use negotiated payload types and correctly handle dynamic `rtpmap` codecs
 - SDP: Implement structural SDP b= bandwidth handling
 - VoIP: Fix an outbound INVITE race where final SIP responses could arrive before the call object was registered (Real race encountered)
@@ -23,7 +24,7 @@
 - VoIP: Ignore unsupported RTP/SAVP offers and reject invalid RTP audio port layouts before ringing.
 - SIP: ACK unmatched final INVITE responses after local call state is gone.
 - SIP: Fix unbounded retry/recursion in SIP deregistration
-- VoIP: Improve "no compatible codecs" codec-negotiation 
+- VoIP: Improve "no compatible codecs" codec-negotiation
 - pyVOIP: Overall improve IPv4/IPv6 RTP address-family handling
 - SIP: Do check IPv4/IPv6
 - SIP&VoIP: If no codecs are compatible then send error to PBX
