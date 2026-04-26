@@ -134,7 +134,7 @@ class VoIPCall:
                         assoc[int(x)] = p
                     except ValueError:
                         try:
-                            p = RTP.PayloadType(
+                            p = RTP.payload_type_from_name(
                                 i["attributes"][x]["rtpmap"]["name"]
                             )
                             assoc[int(x)] = p
@@ -178,17 +178,15 @@ class VoIPCall:
                 media_bandwidth = i.get("bandwidth", [])
 
                 for m in assoc:
-                    if assoc[m] in pyVoIP.RTPCompatibleCodecs and SIP.codec_bandwidth_supported(
-                        assoc[m],
+                    codec = assoc[m]
+                    if codec in pyVoIP.RTPCompatibleCodecs and SIP.codec_bandwidth_supported(
+                        codec,
                         session_bandwidth=session_bandwidth,
                         media_bandwidth=media_bandwidth,
                     ):
-                        codecs[m] = assoc[m]
-                        try:
-                            int(assoc[m])
-                        except Exception:
-                            pass
-                        else:
+
+                        codecs[m] = codec
+                        if RTP.is_transmittable_audio_codec(codec):
                             has_transmittable_codec = True
 
                 if not has_transmittable_codec:
@@ -492,7 +490,7 @@ class VoIPCall:
                     assoc[int(x)] = p
                 except ValueError:
                     try:
-                        p = RTP.PayloadType(
+                        p = RTP.payload_type_from_name(
                             i["attributes"][x]["rtpmap"]["name"]
                         )
                         assoc[int(x)] = p
@@ -510,21 +508,14 @@ class VoIPCall:
             session_bandwidth = request.body.get("b", [])
             media_bandwidth = i.get("bandwidth", [])
             for payload_type, codec in assoc.items():
-                if codec not in pyVoIP.RTPCompatibleCodecs:
-                    continue
-                if not SIP.codec_bandwidth_supported(
+                if codec in pyVoIP.RTPCompatibleCodecs and SIP.codec_bandwidth_supported(
                     codec,
                     session_bandwidth=session_bandwidth,
                     media_bandwidth=media_bandwidth,
                 ):
-                    continue
-                codecs[payload_type] = codec
-                try:
-                    int(codec)
-                except Exception:
-                    pass
-                else:
-                    has_transmittable_codec = True
+                    codecs[payload_type] = codec
+                    if RTP.is_transmittable_audio_codec(codec):
+                        has_transmittable_codec = True
 
             if not has_transmittable_codec:
                 continue
@@ -931,6 +922,24 @@ class VoIPPhone:
     def supported_codecs(self) -> List[Dict[str, Any]]:
         return RTP.supported_codecs()
 
+    def _default_audio_offer(self) -> Dict[int, RTP.PayloadType]:
+        codecs: Dict[int, RTP.PayloadType] = {}
+
+        for codec in pyVoIP.RTPCompatibleCodecs:
+            if not RTP.is_transmittable_audio_codec(codec):
+                continue
+            codecs[int(codec)] = codec
+
+        if RTP.PayloadType.EVENT in pyVoIP.RTPCompatibleCodecs:
+            telephone_event_payload = 101
+            while telephone_event_payload in codecs:
+                telephone_event_payload += 1
+            codecs[telephone_event_payload] = RTP.PayloadType.EVENT
+
+        if not any(RTP.is_transmittable_audio_codec(codec) for codec in codecs.values()):
+            raise RTP.RTPParseError("No transmittable audio codecs are enabled.")
+
+        return codecs
 
     def _has_assignable_audio_ports(self, request: SIP.SIPMessage) -> bool:
         connections = 0
@@ -973,7 +982,7 @@ class VoIPPhone:
                     except KeyError:
                         continue
                     try:
-                        codec = RTP.PayloadType(codec_name)
+                        codec = RTP.payload_type_from_name(codec_name)
                     except ValueError:
                         continue
 
@@ -985,9 +994,8 @@ class VoIPPhone:
                     media_bandwidth=media.get("bandwidth", []),
                 ):
                     continue
-                try:
-                    int(codec)
-                except Exception:
+
+                if not RTP.is_transmittable_audio_codec(codec):
                     continue
                 return True
 
@@ -1276,7 +1284,7 @@ class VoIPPhone:
     def call(self, number: str) -> VoIPCall:
         port = self.request_port()
         medias = {}
-        medias[port] = {0: RTP.PayloadType.PCMU, 101: RTP.PayloadType.EVENT}
+        medias[port] = self._default_audio_offer()
         call_id: Optional[str] = None
         self._outbound_call_creation_depth += 1
         try:

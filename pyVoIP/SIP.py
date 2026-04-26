@@ -1124,6 +1124,8 @@ def _unknown_codec_info(
         "payload_type": payload_type,
         "name": name,
         "description": None,
+        "payload_kind": "unknown",
+        "can_transmit_audio": False,
         "rate": rate,
         "channels": channels,
         "is_dynamic": payload_type is None or payload_type >= 96,

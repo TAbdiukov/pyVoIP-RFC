@@ -2,6 +2,7 @@
 
 ## 2.7.6+RFC
 
+- RTP: Fix codec negotiation to use negotiated payload types and correctly handle dynamic `rtpmap` codecs
 - SDP: Implement structural SDP b= bandwidth handling
 - VoIP: Fix an outbound INVITE race where final SIP responses could arrive before the call object was registered (Real race encountered)
 - Misc: Fix typos and clearer language
