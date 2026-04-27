@@ -3,6 +3,14 @@ from enum import Enum, IntEnum
 from threading import Timer, Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from pyVoIP.util import acquired_lock_and_unblocked_socket
+from pyVoIP.SIPTransport import (
+    ResolvedSIPTarget,
+    SIPConnection,
+    SIPResolver,
+    SIPTransport,
+    format_hostport,
+    split_hostport,
+)
 from pyVoIP.VoIP.status import PhoneStatus
 import pyVoIP
 import hashlib
