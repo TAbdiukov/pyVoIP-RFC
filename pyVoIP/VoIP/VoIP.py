@@ -700,6 +700,9 @@ class VoIPPhone:
         proxy: Optional[str] = None,
         proxyPort: Optional[int] = None,
         proxy_port: Optional[int] = None,
+        transport: Optional[str] = None,
+        tls_context: Any = None,
+        tls_server_name: Optional[str] = None,
     ):
         if rtpPortLow > rtpPortHigh:
             raise InvalidRangeError("'rtpPortHigh' must be >= 'rtpPortLow'")
@@ -725,6 +728,9 @@ class VoIPPhone:
         )
         self.proxy = proxy
         self.proxyPort = proxyPort
+        self.transport = transport
+        self.tls_context = tls_context
+        self.tls_server_name = tls_server_name
         self.callCallback = callCallback
         self._status = PhoneStatus.INACTIVE
 
@@ -753,6 +759,9 @@ class VoIPPhone:
             auth_username=self.auth_username,
             proxy=self.proxy,
             proxy_port=self.proxyPort,
+            transport=self.transport,
+            tls_context=self.tls_context,
+            tls_server_name=self.tls_server_name,
         )
 
     def _queue_unmatched_final_invite_response(
@@ -814,7 +823,7 @@ class VoIPPhone:
             return
         ack = self.sip.gen_ack(request)
         host, port = self.sip.ack_target(request)
-        self.sip.out.sendto(ack.encode("utf8"), (host, port))
+        self.sip.send_raw(ack.encode("utf8"), (host, port))
         setattr(request, "_pyvoip_ack_sent", True)
 
     def callback(self, request: SIP.SIPMessage) -> None:

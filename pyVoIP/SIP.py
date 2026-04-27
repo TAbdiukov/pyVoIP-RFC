@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 import select
+import ssl
 import warnings
 
 
@@ -33,6 +34,7 @@ __all__ = [
     "SIPRequestError",
     "SIPSubscription",
     "SIPStatus",
+    "SIPTransport",
     "sip_supported_codecs",
 ]
 
@@ -543,25 +545,29 @@ class SIPMessage:
     def parse_header(self, header: str, data: str) -> None:
         if header == "Via":
             for d in data:
-                info = re.split(" |;", d)
-                _type = info[0]  # SIP Method
-                _address = info[1].split(":")  # Tuple: address, port
-                _ip = _address[0]
-
-                """
-                If no port is provided in via header assume default port.
-                Needs to be str. Check response build for better str creation
-                """
-                _port = info[1].split(":")[1] if len(_address) > 1 else "5060"
-                _via = {"type": _type, "address": (_ip, _port)}
+                pieces = d.split(";")
+                sent_by = pieces[0].strip().split()
+                if len(sent_by) < 2:
+                    continue
+                _type = sent_by[0]
+                _ip, _port, _explicit = split_hostport(sent_by[1], 5060)
+                _via = {
+                    "type": _type,
+                    "transport": _type.rsplit("/", 1)[-1].upper(),
+                    "address": (_ip, str(_port or 5060)),
+                }
 
                 """
                 Sets branch, maddr, ttl, received, and rport if defined
                 as per RFC 3261 20.7
                 """
-                for x in info[2:]:
-                    if "=" in x:
-                        _via[x.split("=")[0]] = x.split("=")[1]
+                for x in pieces[1:]:
+                    x = x.strip()
+                    if not x:
+                        continue
+                     if "=" in x:
+                        key, val = x.split("=", 1)
+                        _via[key] = val
                     else:
                         _via[x] = None
                 self.headers["Via"].append(_via)
@@ -1282,7 +1288,7 @@ class SIPClient:
     def __init__(
         self,
         server: str,
-        port: int,
+        port: Optional[int],
         username: str,
         password: str,
         phone: "VoIPPhone",
@@ -1294,13 +1300,38 @@ class SIPClient:
         proxy: Optional[str] = None,
         proxy_port: Optional[int] = None,
         proxyPort: Optional[int] = None,
+        transport: Optional[str] = None,
+        tls_context: Optional[ssl.SSLContext] = None,
+        tls_server_name: Optional[str] = None,
     ):
         self.NSD = False
         self.server = server
-        self.port = port
-        self.server_host, self.server_port = self._sip_target_from_uri(
-            str(server), port
+        self.requested_transport = (
+            None if transport is None else SIPTransport.from_uri(transport)
+         )
+        self.resolver = SIPResolver(
+            transport_preference=(
+                [self.requested_transport]
+                if self.requested_transport is not None
+                else None
+            )
         )
+        self.server_uri = self.resolver.parse_uri(str(server))
+        self.server_scheme = self.server_uri.scheme
+        self.server_host = self.server_uri.host
+        self.server_uri_port = (
+            self.server_uri.port
+            if self.server_uri.explicit_port
+            else (port if not self.server_uri.has_scheme else None)
+        )
+        self.server_target = self.resolver.resolve(
+            str(server),
+            default_port=port,
+            default_transport=self.requested_transport,
+        )
+        self.server_port = self.server_uri_port
+        self.port = port if port is not None else self.server_target.port
+
         self.myIP = myIP
         self.username = username
         self.password = password
@@ -1310,9 +1341,12 @@ class SIPClient:
 
         if proxy_port is None:
             proxy_port = proxyPort
-        self.proxy, self.proxy_port = self._normalize_proxy_target(
-            proxy, proxy_port, self.port
-        )
+        self.proxy_target = self._normalize_proxy_target(proxy, proxy_port)
+        self.proxy = self.proxy_target.host if self.proxy_target else None
+        self.proxy_port = self.proxy_target.port if self.proxy_target else None
+        self.tls_context = tls_context
+        self.tls_server_name = tls_server_name
+        self.connection: Optional[SIPConnection] = None
 
         self.phone = phone
 
@@ -1362,60 +1396,33 @@ class SIPClient:
         return value.strip()
 
     @staticmethod
-    def _sip_target_from_uri(uri: str, default_port: int = 5060) -> Tuple[str, int]:
-        target = uri.strip()
-        if target.startswith("<") and target.endswith(">"):
-            target = target[1:-1].strip()
-        if target.lower().startswith("sip:"):
-            target = target[4:]
-        if "@" in target:
-            target = target.split("@", 1)[1]
-        target = target.split("?", 1)[0]
-        if ";" in target:
-            target = target.split(";", 1)[0]
+    def _sip_target_from_uri(
+        uri: str, default_port: Optional[int] = 5060
+    ) -> Tuple[str, int]:
+        target = SIPResolver().resolve(uri, default_port=default_port)
+        return target.host, target.port
 
-        if target.startswith("["):
-            host, separator, rest = target[1:].partition("]")
-            if separator:
-                if rest.startswith(":"):
-                    try:
-                        return host, int(rest[1:])
-                    except ValueError:
-                        pass
-                return host, default_port
-
-        try:
-            ipaddress.ip_address(target)
-            return target, default_port
-        except ValueError:
-            pass
-
-        if ":" in target:
-            host, port = target.rsplit(":", 1)
-            try:
-                return host, int(port)
-            except ValueError:
-                pass
-        return target, default_port
-
-    @classmethod
     def _normalize_proxy_target(
-        cls,
+        self,
         proxy: Optional[str],
         proxy_port: Optional[int],
-        default_port: int,
-    ) -> Tuple[Optional[str], Optional[int]]:
+    ) -> Optional[ResolvedSIPTarget]:
         raw = str(proxy or "").strip()
         if not raw:
-            return None, None
-        host, parsed_port = cls._sip_target_from_uri(raw, default_port)
-        port = parsed_port if proxy_port is None else int(proxy_port)
-        return host, port
+            return None
+        return self.resolver.resolve(
+            raw,
+            default_port=proxy_port,
+            default_transport=self.requested_transport,
+        )
 
     def signal_target(self) -> Tuple[str, int]:
-        if self.proxy is not None and self.proxy_port is not None:
-            return self.proxy, self.proxy_port
-        return self.server_host, self.server_port
+        target = self.proxy_target or self.server_target
+        return target.host, target.port
+
+    def signal_transport(self) -> SIPTransport:
+        target = self.proxy_target or self.server_target
+        return target.transport
 
     def response_target(self, request: SIPMessage) -> Tuple[str, int]:
         try:
@@ -1450,19 +1457,9 @@ class SIPClient:
         *,
         always_include_port: bool = False,
     ) -> str:
-        formatted_host = str(host).strip()
-
-        # SIP URI hostports require IPv6 literals to be enclosed in brackets,
-        # otherwise the colons in the address are ambiguous with the port
-        # separator.
-        if ":" in formatted_host and not (
-            formatted_host.startswith("[") and formatted_host.endswith("]")
-        ):
-            formatted_host = f"[{formatted_host}]"
-
-        if port is not None and (always_include_port or int(port) != 5060):
-            return f"{formatted_host}:{int(port)}"
-        return formatted_host
+        return format_hostport(
+            host, port, always_include_port=always_include_port
+        )
 
     @classmethod
     def _format_sip_uri(
@@ -1473,8 +1470,9 @@ class SIPClient:
         user: Optional[str] = None,
         transport: Optional[str] = None,
         always_include_port: bool = False,
+        scheme: str = "sip",
     ) -> str:
-        uri = "sip:"
+        uri = f"{scheme}:"
         if user:
             uri += f"{user}@"
         uri += cls._format_hostport(
@@ -1502,12 +1500,21 @@ class SIPClient:
         initial REGISTER, refresh REGISTER, and deregistration avoids stale
         bindings on strict registrars.
         """
+        contact_scheme = "sips" if self.server_scheme == "sips" else "sip"
+        transport = self.signal_transport()
+        transport_token = (
+            "TCP"
+            if contact_scheme == "sips" and transport == SIPTransport.TLS
+            else transport.uri_token
+        )
+
         return self._format_sip_uri(
             self.myIP,
             self.myPort,
             user=user or self.username,
-            transport="UDP",
+            transport=transport_token,
             always_include_port=True,
+            scheme=contact_scheme,
         )
 
     def _contact_header(self, *, include_instance: bool = False) -> str:
@@ -1532,13 +1539,56 @@ class SIPClient:
     ) -> str:
         return self._format_sip_uri(
             self.server_host,
-            self.server_port,
+            self.server_uri_port,
             user=user,
             transport=transport,
+            scheme=self.server_scheme,
         )
 
     def _remote_user_uri(self, user: str) -> str:
-        return self._format_sip_uri(self.server_host, self.server_port, user=user)
+        return self._format_sip_uri(
+            self.server_host,
+            self.server_uri_port,
+            user=user,
+            scheme=self.server_scheme,
+        )
+
+    def _via_header(
+        self,
+        *,
+        branch: Optional[str] = None,
+        rport: bool = True,
+    ) -> str:
+        branch = branch or self.gen_branch()
+        line = (
+            f"Via: SIP/2.0/{self.signal_transport().via_token} "
+            + self._format_hostport(
+                self.myIP,
+                self.myPort,
+                always_include_port=True,
+            )
+            + f";branch={branch}"
+        )
+        if rport:
+            line += ";rport"
+        return line + "\r\n"
+
+    def send_raw(
+        self,
+        data: bytes,
+        target: Optional[Tuple[str, int]] = None,
+    ) -> None:
+        if self.connection is None:
+            raise RuntimeError("SIP client is not connected.")
+        self.connection.send(data, target or self.signal_target())
+
+    def _recv_message_before(self, deadline: float) -> Optional[SIPMessage]:
+        if self.connection is None:
+            return None
+        raw = self.connection.recv_raw_message_before(
+            deadline, running=lambda: self.NSD
+        )
+        return SIPMessage(raw) if raw is not None else None
 
     def send_response(self, request: SIPMessage, response: str) -> None:
         self._send_request_response(request, response)
@@ -1672,10 +1722,7 @@ class SIPClient:
         )
 
         request = f"SUBSCRIBE {request_uri} SIP/2.0\r\n"
-        request += (
-            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
-            + f"branch={self.gen_branch()};rport\r\n"
-        )
+        request += self._via_header(rport=True)
         request += "Max-Forwards: 70\r\n"
         request += self._contact_header()
         request += f"To: {self._subscription_to_header(subscription)}\r\n"
@@ -1699,10 +1746,7 @@ class SIPClient:
     def _send_request_response(
         self, request: SIPMessage, response: str
     ) -> None:
-        self.out.sendto(
-            response.encode("utf8"),
-            self.response_target(request),
-        )
+        self.send_raw(response.encode("utf8"), self.response_target(request))
 
     @staticmethod
     def _request_header_value(request: str, header: str) -> str:
@@ -1730,8 +1774,7 @@ class SIPClient:
         *,
         action: str,
     ) -> SIPMessage:
-        self.out.setblocking(False)
-        self.out.sendto(request.encode("utf8"), self.signal_target())
+        self.send_raw(request.encode("utf8"), self.signal_target())
         return self._wait_for_transaction_response(request, action=action)
 
     def _wait_for_transaction_response(
@@ -1745,12 +1788,10 @@ class SIPClient:
         last_provisional: Optional[SIPMessage] = None
 
         while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
-            ready = select.select([self.s], [], [], remaining)
-            if not ready[0]:
+            response = self._recv_message_before(deadline)
+            if response is None:
                 break
 
-            response = SIPMessage(self.s.recv(8192))
             if response.type == SIPMessageType.MESSAGE:
                 self.parse_message(response)
                 continue
@@ -2096,7 +2137,7 @@ class SIPClient:
         )
 
         with self.recvLock:
-            self.out.sendto(
+            self.send_raw(
                 request.encode("utf8"),
                 self._subscription_send_target(subscription),
             )
@@ -2104,12 +2145,10 @@ class SIPClient:
             retries = 0
 
             while self.NSD and time.monotonic() < deadline:
-                timeout = min(1.0, max(0.0, deadline - time.monotonic()))
-                ready = select.select([self.s], [], [], timeout)
-                if not ready[0]:
+                response = self._recv_message_before(deadline)
+                if response is None:
                     continue
 
-                response = SIPMessage(self.s.recv(8192))
                 if response.type == SIPMessageType.MESSAGE:
                     if response.method == "NOTIFY":
                         self._handle_notify(response)
@@ -2157,7 +2196,7 @@ class SIPClient:
                         expires=subscription.pending_expires,
                         auth_line=auth_line,
                     )
-                    self.out.sendto(
+                    self.send_raw(
                         request.encode("utf8"),
                         self._subscription_send_target(subscription),
                     )
@@ -2202,7 +2241,7 @@ class SIPClient:
         request = self._build_subscribe_request(subscription, expires=0)
 
         with self.recvLock:
-            self.out.sendto(
+            self.send_raw(
                 request.encode("utf8"),
                 self._subscription_send_target(subscription),
             )
@@ -2210,12 +2249,10 @@ class SIPClient:
             retries = 0
 
             while self.NSD and time.monotonic() < deadline:
-                timeout = min(1.0, max(0.0, deadline - time.monotonic()))
-                ready = select.select([self.s], [], [], timeout)
-                if not ready[0]:
+                response = self._recv_message_before(deadline)
+                if response is None:
                     continue
 
-                response = SIPMessage(self.s.recv(8192))
                 if response.type == SIPMessageType.MESSAGE:
                     if response.method == "NOTIFY":
                         self._handle_notify(response)
@@ -2263,7 +2300,7 @@ class SIPClient:
                         expires=0,
                         auth_line=auth_line,
                     )
-                    self.out.sendto(
+                    self.send_raw(
                         request.encode("utf8"),
                         self._subscription_send_target(subscription),
                     )
@@ -2361,7 +2398,7 @@ class SIPClient:
 
     def recv(self) -> None:
         try:
-            raw = self.s.recv(8192)
+            raw = self.connection.recv_raw_message()
         except BlockingIOError:
             # Re-raise so recv_loop() can release locks and continue
             raise
@@ -2375,9 +2412,7 @@ class SIPClient:
             if "SIP Version" in str(e):
                 try:
                     resp = self._gen_sip_version_not_supported_raw(raw)
-                    self.out.sendto(
-                        resp.encode("utf8"), self.signal_target()
-                    )
+                    self.send_raw(resp.encode("utf8"), self.signal_target())
                 except Exception as ex:
                     debug(f"Failed sending 505 response: {ex}")
             else:
@@ -2528,9 +2563,16 @@ class SIPClient:
         if self.NSD:
             raise RuntimeError("Attempted to start already started SIPClient")
         self.NSD = True
-        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.s.bind((self.myIP, self.myPort))
+        target = self.proxy_target or self.server_target
+        self.connection = SIPConnection(
+            self.myIP,
+            self.myPort,
+            target,
+            tls_context=self.tls_context,
+            tls_server_name=self.tls_server_name,
+        )
+        self.connection.open()
+        self.s = self.connection.socket
         self.out = self.s
         self.register()
         t = Timer(1, self.recv_loop)
@@ -2549,6 +2591,11 @@ class SIPClient:
         self._close_sockets()
 
     def _close_sockets(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+            return
+
         if hasattr(self, "s") and self.s:
             self.s.close()
         if hasattr(self, "out") and self.out:
@@ -2662,7 +2709,7 @@ class SIPClient:
             ""
             + request.headers["CSeq"]["method"]
             + ":"
-            + self._registrar_uri(transport="UDP")
+            + self._registrar_uri()
         )
         HA2 = hashlib.md5(HA2.encode("utf8")).hexdigest()
         nonce = request.authentication["nonce"]
@@ -2710,10 +2757,7 @@ class SIPClient:
 
     def gen_first_response(self, deregister=False) -> str:
         regRequest = f"REGISTER {self._registrar_uri()} SIP/2.0\r\n"
-        regRequest += (
-            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
-            + f"branch={self.gen_branch()};rport\r\n"
-        )
+        regRequest += self._via_header(rport=True)
         regRequest += (
             f'From: "{self.username}" '
             + f"<{self._registrar_uri(user=self.username)}>;tag="
@@ -2753,10 +2797,7 @@ class SIPClient:
         subRequest = (
             f"SUBSCRIBE {self._registrar_uri(user=self.username)} SIP/2.0\r\n"
         )
-        subRequest += (
-            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
-            + f"branch={self.gen_branch()};rport\r\n"
-        )
+        subRequest += self._via_header(rport=True)
         subRequest += (
             f'From: "{self.username}" '
             + f"<{self._registrar_uri(user=self.username)}>;tag="
@@ -2797,15 +2838,12 @@ class SIPClient:
             request,
             header_name=header_name,
             method="REGISTER",
-            uri=self._registrar_uri(transport="UDP"),
+            uri=self._registrar_uri(),
         )
 
         regRequest = f"REGISTER {self._registrar_uri()} SIP/2.0\r\n"
 
-        regRequest += (
-            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};branch="
-            + f"{self.gen_branch()};rport\r\n"
-        )
+        regRequest += self._via_header(rport=True)
         regRequest += (
             f'From: "{self.username}" '
             + f"<{self._registrar_uri(user=self.username)}>;tag="
@@ -3061,10 +3099,7 @@ class SIPClient:
 
         remote_uri = self._remote_user_uri(number)
         invRequest = f"INVITE {remote_uri} SIP/2.0\r\n"
-        invRequest += (
-            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};branch="
-            + f"{branch}\r\n"
-        )
+        invRequest += self._via_header(branch=branch, rport=True)
         invRequest += "Max-Forwards: 70\r\n"
         invRequest += self._contact_header()
         invRequest += f"To: <{remote_uri}>\r\n"
@@ -3107,7 +3142,7 @@ class SIPClient:
 
     def cancel(self, request: SIPMessage) -> None:
         message = self.gen_cancel(request)
-        self.out.sendto(message.encode("utf8"), self.signal_target())
+        self.send_raw(message.encode("utf8"), self.signal_target())
 
     def genBye(self, request: SIPMessage) -> str:
         warnings.warn(
@@ -3122,10 +3157,7 @@ class SIPClient:
         tag = self.tagLibrary[request.headers["Call-ID"]]
         c = self._dialog_remote_uri(request)
         byeRequest = f"BYE {c} SIP/2.0\r\n"
-        byeRequest += (
-            f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
-            + f"branch={self.gen_branch()};rport\r\n"
-        )
+        byeRequest += self._via_header(rport=True)
         fromH = request.headers["From"]["raw"]
         toH = request.headers["To"]["raw"]
         if request.headers["From"]["tag"] == tag:
@@ -3174,7 +3206,7 @@ class SIPClient:
         if is_2xx and request.headers.get("Contact"):
             ack_uri = self._extract_uri(str(request.headers["Contact"]))
             via = (
-                f"Via: SIP/2.0/UDP {self.myIP}:{self.myPort};"
+                via = self._via_header(rport=True)
                 + f"branch={self.gen_branch()};rport\r\n"
             )
         else:
@@ -3205,8 +3237,13 @@ class SIPClient:
         via = ""
         for h_via in request.headers["Via"]:
             v_line = (
-                "Via: SIP/2.0/UDP "
-                + f'{h_via["address"][0]}:{h_via["address"][1]}'
+                "Via: "
+                + f'{h_via.get("type", "SIP/2.0/UDP")} '
+                + self._format_hostport(
+                    h_via["address"][0],
+                    int(h_via["address"][1]),
+                    always_include_port=True,
+                )
             )
             if "branch" in h_via.keys():
                 v_line += f';branch={h_via["branch"]}'
@@ -3264,7 +3301,7 @@ class SIPClient:
             number, str(sess_id), ms, sendtype, branch, call_id
         )
         with self.recvLock:
-            self.out.sendto(invite.encode("utf8"), self.signal_target())
+            self.send_raw(invite.encode("utf8"), self.signal_target())
             self._set_last_invite_debug(event="invite-sent")
             debug("Invited")
             deadline = time.monotonic() + self.invite_timeout
@@ -3272,12 +3309,10 @@ class SIPClient:
             last_response: Optional[SIPMessage] = None
 
             while self.NSD and time.monotonic() < deadline:
-                timeout = min(1.0, max(0.0, deadline - time.monotonic()))
-                ready = select.select([self.s], [], [], timeout)
-                if not ready[0]:
+                response = self._recv_message_before(deadline)
+                if response is None:
                     continue
 
-                response = SIPMessage(self.s.recv(8192))
                 last_response = response
 
                 if response.headers.get("Call-ID") != call_id:
@@ -3322,10 +3357,7 @@ class SIPClient:
                     SIPStatus.PROXY_AUTHENTICATION_REQUIRED,
                 ) and retries < self.invite_max_retries:
                     ack = self.gen_ack(response)
-                    self.out.sendto(
-                        ack.encode("utf8"),
-                        self.ack_target(response),
-                    )
+                    self.send_raw(ack.encode("utf8"), self.ack_target(response))
 
                     header_name = "Authorization"
                     if (
@@ -3350,7 +3382,7 @@ class SIPClient:
                         "\r\nContent-Length",
                         f"\r\n{auth_line}Content-Length",
                     )
-                    self.out.sendto(invite.encode("utf8"), self.signal_target())
+                    self.send_raw(invite.encode("utf8"), self.signal_target())
                     retries += 1
                     self._set_last_invite_debug(
                         event="invite-auth-sent",
@@ -3477,10 +3509,7 @@ class SIPClient:
 
     def bye(self, request: SIPMessage) -> None:
         message = self.gen_bye(request)
-        self.out.sendto(
-            message.encode("utf8"),
-            self.dialog_target(request),
-        )
+        self.send_raw(message.encode("utf8"), self.dialog_target(request))
 
     def deregister(self) -> bool:
         attempts = 0
@@ -3725,12 +3754,11 @@ class SIPClient:
                     + "still TRYING"
                 )
 
-            ready = select.select([self.s], [], [], remaining)
-            if not ready[0]:
+            response = self._recv_message_before(time.monotonic() + remaining)
+            if response is None:
                 raise TimeoutError(
                     f"Waited {self.register_timeout} seconds but server is "
                     + "still TRYING"
                 )
-            resp = self.s.recv(8192)
-            response = SIPMessage(resp)
+
         return response

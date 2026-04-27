@@ -1,7 +1,13 @@
 # Changelog
 
+## 2.7.7+RFC
+
+- SIP Experimental: Add TCP/TLS SIP transport with RFC 3263-compliant resolution
+(NAPTR/SRV, `;transport=` support, and TLS via SIPS)
+
 ## 2.7.6+RFC
 
+- SIP (misc): Keep the local contact port explicit (prepare for different transport support)
 - SIP: Consolidate Contact header generation and explicitly advertise transport across SIP requests (fixing inconsistent URI handling).
 - RTP: Fix codec negotiation to use negotiated payload types and correctly handle dynamic `rtpmap` codecs
 - SDP: Implement structural SDP b= bandwidth handling
