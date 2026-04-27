@@ -1493,12 +1493,20 @@ class SIPClient:
         transport parameter is therefore advertised explicitly so registrars,
         notifiers, and dialog peers route subsequent requests back over the
         transport pyVoIP can actually receive.
+
+        Keep the local port explicit even when it is the default SIP port
+        5060.  RFC 3261 URI comparison does not require an omitted default
+        port to compare equal to an explicit port, and a URI with no transport
+        parameter can compare differently from the same URI with
+        ``;transport=udp``.  Emitting the same explicit Contact binding for
+        initial REGISTER, refresh REGISTER, and deregistration avoids stale
+        bindings on strict registrars.
         """
         return self._format_sip_uri(
             self.myIP,
             self.myPort,
             user=user or self.username,
-            transport="UDP",
+            transport="udp",
             always_include_port=True,
         )
 
