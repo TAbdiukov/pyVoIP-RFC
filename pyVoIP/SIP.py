@@ -1506,7 +1506,7 @@ class SIPClient:
             self.myIP,
             self.myPort,
             user=user or self.username,
-            transport="udp",
+            transport="UDP",
             always_include_port=True,
         )
 

@@ -30,11 +30,11 @@ def test_contact_uri_keeps_default_port_and_udp_transport():
 
     assert (
         client._contact_uri()
-        == "sip:alice@192.0.2.10:5060;transport=udp"
+        == "sip:alice@192.0.2.10:5060;transport=UDP"
     )
     assert (
         client._contact_header()
-        == "Contact: <sip:alice@192.0.2.10:5060;transport=udp>\r\n"
+        == "Contact: <sip:alice@192.0.2.10:5060;transport=UDP>\r\n"
     )
 
 
@@ -43,7 +43,7 @@ def test_contact_uri_keeps_explicit_ipv6_default_port_and_udp_transport():
 
     assert (
         client._contact_uri()
-        == "sip:alice@[2001:db8::10]:5060;transport=udp"
+        == "sip:alice@[2001:db8::10]:5060;transport=UDP"
     )
 
 
@@ -66,7 +66,7 @@ def test_register_refresh_and_deregister_use_same_contact_binding():
     deregister = client.gen_first_response(deregister=True)
 
     expected = (
-        'Contact: <sip:alice@192.0.2.10:5060;transport=udp>'
+        'Contact: <sip:alice@192.0.2.10:5060;transport=UDP>'
         f';+sip.instance="<urn:uuid:{client.urnUUID}>"'
     )
 
