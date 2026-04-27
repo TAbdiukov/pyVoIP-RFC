@@ -67,7 +67,7 @@ phone = VoIPPhone(
 
 ### TCP/TLS SIP transport with RFC 3263-compliant resolution
 
-```
+```python
 # TCP, explicit URI transport wins.
 phone = VoIPPhone(
     "sip:registrar.example.com;transport=tcp",
